@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="StayOnTrack sample" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>Dragon's Back (sample)</name>
+    <trkseg>
+      <trkpt lat="22.22050" lon="114.24300"><ele>105</ele></trkpt>
+      <trkpt lat="22.22190" lon="114.24460"><ele>140</ele></trkpt>
+      <trkpt lat="22.22360" lon="114.24580"><ele>190</ele></trkpt>
+      <trkpt lat="22.22540" lon="114.24660"><ele>245</ele></trkpt>
+      <trkpt lat="22.22720" lon="114.24700"><ele>284</ele></trkpt>
+      <trkpt lat="22.22910" lon="114.24680"><ele>270</ele></trkpt>
+      <trkpt lat="22.23090" lon="114.24610"><ele>230</ele></trkpt>
+      <trkpt lat="22.23260" lon="114.24500"><ele>195</ele></trkpt>
+      <trkpt lat="22.23440" lon="114.24420"><ele>160</ele></trkpt>
+      <trkpt lat="22.23640" lon="114.24380"><ele>120</ele></trkpt>
+      <trkpt lat="22.23850" lon="114.24390"><ele>85</ele></trkpt>
+      <trkpt lat="22.24050" lon="114.24450"><ele>60</ele></trkpt>
+    </trkseg>
+  </trk>
+</gpx>
