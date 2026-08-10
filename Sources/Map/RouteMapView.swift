@@ -113,7 +113,7 @@ struct RouteMapView: UIViewRepresentable {
                 .joined(separator: ",")
             if junctionSig != lastJunctionSig {
                 map.removeAnnotations(map.annotations.compactMap { $0 as? JunctionAnnotation })
-                map.addAnnotations(junctions.enumerated().map { JunctionAnnotation($1, number: $0 + 1) })
+                map.addAnnotations(junctions.map(JunctionAnnotation.init))
                 lastJunctionSig = junctionSig
             }
 
@@ -243,10 +243,8 @@ struct RouteMapView: UIViewRepresentable {
                     ?? MKAnnotationView(annotation: annotation, reuseIdentifier: id)
                 view.annotation = annotation
                 view.transform = .identity   // arrow is baked into the image
-                let img = JunctionIcon.image(bearing: junction.outBearing, number: junction.number)
-                view.image = img
-                // Circle centre sits on the junction; number hangs below.
-                view.centerOffset = CGPoint(x: 0, y: JunctionIcon.circle / 2 - img.size.height / 2)
+                view.image = JunctionIcon.image(bearing: junction.outBearing)
+                view.centerOffset = .zero    // disc sits on the junction
                 view.canShowCallout = false
                 view.displayPriority = .required
                 return view
@@ -272,9 +270,8 @@ final class WalkerAnnotation: NSObject, MKAnnotation {
 final class JunctionAnnotation: NSObject, MKAnnotation {
     let coordinate: CLLocationCoordinate2D
     let outBearing: Double       // absolute compass heading the route leaves on
-    let number: Int              // temporary label so John can flag wrong ones
-    init(_ j: Junction, number: Int) {
-        coordinate = j.coordinate; outBearing = j.outBearing; self.number = number
+    init(_ j: Junction) {
+        coordinate = j.coordinate; outBearing = j.outBearing
     }
 }
 
@@ -323,38 +320,28 @@ enum EndpointSign {
     }
 }
 
-/// A circle with an arrow that points in the actual compass direction the
-/// hiker should head (north-up map), plus a small number below for debugging.
+/// A discreet dark disc with a white arrow pointing in the actual compass
+/// direction the hiker should head (north-up map).
 enum JunctionIcon {
     static let circle: CGFloat = 30
-    private static var cache: [String: UIImage] = [:]
+    private static var cache: [Int: UIImage] = [:]
 
-    static func image(bearing: Double, number: Int) -> UIImage {
-        let key = "\(Int(bearing.rounded()))-\(number)"
+    static func image(bearing: Double) -> UIImage {
+        let key = Int(bearing.rounded())
         if let img = cache[key] { return img }
 
-        let numFont = UIFont.systemFont(ofSize: 11, weight: .bold)
-        let numText = "\(number)" as NSString
-        let numAttrs: [NSAttributedString.Key: Any] = [
-            .font: numFont, .foregroundColor: UIColor.systemBlue
-        ]
-        let numSize = numText.size(withAttributes: numAttrs)
-        let gap: CGFloat = 1
-        let w = max(circle, numSize.width + 6)
-        let h = circle + gap + numSize.height
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: w, height: h))
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: circle, height: circle))
         let img = renderer.image { ctx in
             let c = ctx.cgContext
-            let cx = w / 2, cy = circle / 2
-            // Discreet dark semi-transparent disc — no outline, no fill circle.
-            let discRect = CGRect(x: cx - circle/2 + 2, y: 2, width: circle - 4, height: circle - 4)
+            let mid = circle / 2
+            // Discreet dark semi-transparent disc — no outline.
+            let discRect = CGRect(x: 2, y: 2, width: circle - 4, height: circle - 4)
             UIColor.black.withAlphaComponent(0.38).setFill()
             c.fillEllipse(in: discRect)
 
             // Plain white arrow, pointing up then rotated to the compass bearing
             // (clockwise in this y-down context) about the disc centre.
-            c.saveGState()
-            c.translateBy(x: cx, y: cy)
+            c.translateBy(x: mid, y: mid)
             c.rotate(by: bearing * .pi / 180)
             UIColor.white.setStroke(); UIColor.white.setFill()
             c.setLineWidth(2.2); c.setLineCap(.round); c.setLineJoin(.round)
@@ -366,11 +353,6 @@ enum JunctionIcon {
             c.addLine(to: CGPoint(x: -4.5, y: -half + 9))
             c.addLine(to: CGPoint(x: 4.5, y: -half + 9))
             c.closePath(); c.fillPath()
-            c.restoreGState()
-
-            // Number below, upright (temporary debug label).
-            numText.draw(at: CGPoint(x: (w - numSize.width) / 2, y: circle + gap),
-                         withAttributes: numAttrs)
         }
         cache[key] = img
         return img

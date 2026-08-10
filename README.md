@@ -55,6 +55,10 @@ Everything needed for the hike is downloaded once (map, trails, elevation) when 
 **Testing**
 - A **drag-to-walk simulation**: drag the position marker and the whole app behaves as if you're walking there — directions, off-trail tone, stats, recording — so it can be developed and demoed without leaving your desk.
 
+## Install (sideload)
+
+Stay on Track isn't on the App Store. Grab the latest **[release IPA](https://github.com/johnbuckman/stayontrack/releases/latest)** and install it on your iPhone with your own Apple ID using [**SideStep**](https://github.com/johnbuckman/SideStep) (macOS), which re-signs the app for your device. It's also listed in SideStep's built-in app catalog. Requires iOS 17.
+
 ## How it works
 
 - **SwiftUI** app; **MapKit** with a custom `MKTileOverlay` serving cached OSM raster tiles; **CoreLocation** for tracking; **AVFoundation** for the tone (synthesised sine) and the bundled voice clips.
