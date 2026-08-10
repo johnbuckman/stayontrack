@@ -12,6 +12,9 @@ targets:
       - path: Sources
       - path: Resources
         buildPhase: resources
+    dependencies:
+      - target: StayOnTrackWidgets
+        embed: true
     info:
       path: Sources/Info.plist
       properties:
@@ -58,6 +61,33 @@ targets:
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         # Ad-hoc sign so the Catalyst app runs locally without a team.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+
+  StayOnTrackWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: StayOnTrackWidgets
+      - path: Sources/Shared/HikeActivityAttributes.swift   # shared with the app target
+    info:
+      path: StayOnTrackWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Stay on Track
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.johnbuckman.stayontrack.widgets
+        GENERATE_INFOPLIST_FILE: NO
+        SUPPORTS_MACCATALYST: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        SWIFT_VERSION: "5.0"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SKIP_INSTALL: YES
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "-"
         DEVELOPMENT_TEAM: ""

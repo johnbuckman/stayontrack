@@ -4,17 +4,6 @@ import UserNotifications
 import ActivityKit
 #endif
 
-#if !targetEnvironment(macCatalyst)
-/// Shared Live Activity data (iPhone). The widget extension renders this.
-struct HikeActivityAttributes: ActivityAttributes {
-    struct ContentState: Codable, Hashable {
-        var instruction: String     // e.g. "Keep left"
-        var meters: Int             // distance to the junction
-    }
-    var routeName: String
-}
-#endif
-
 /// Presents the "next junction" status where the OS supports it:
 ///   • iPhone  → a Live Activity (Lock Screen + Dynamic Island)
 ///   • Catalyst/Mac → a local notification (so we can test/debug the same flow)
