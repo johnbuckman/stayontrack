@@ -57,7 +57,9 @@ Everything needed for the hike is downloaded once (map, trails, elevation) when 
 
 ## Install (sideload)
 
-Stay on Track isn't on the App Store. Grab the latest **[release IPA](https://github.com/johnbuckman/stayontrack/releases/latest)** and install it on your iPhone with your own Apple ID using [**SideStep**](https://github.com/johnbuckman/SideStep) (macOS), which re-signs the app for your device. It's also listed in SideStep's built-in app catalog. Requires iOS 17.
+[![One-tap install for iPhone / iPad via SideStep](https://img.shields.io/badge/⬇_One--tap_install_(iPhone_%2F_iPad)-via_SideStep-0a84ff?style=for-the-badge&logo=apple)](https://github.com/johnbuckman/stayontrack/releases/latest/download/stayontrack-installer.zip)
+
+Stay on Track isn't on the App Store. The one-tap installer above (run it on a Mac) downloads [**SideStep**](https://github.com/johnbuckman/SideStep) and installs Stay on Track onto your iPhone/iPad, signed with your own Apple ID. Or grab the raw **[release IPA](https://github.com/johnbuckman/stayontrack/releases/latest)** and sideload it yourself — it's also listed in SideStep's built-in app catalog. Requires iOS 17.
 
 ## How it works
 

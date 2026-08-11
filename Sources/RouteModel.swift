@@ -50,6 +50,16 @@ final class RouteModel: ObservableObject {
 
     var routeName: String { route?.name ?? "Hike" }
 
+    /// Elevation profile (cumulative distance + elevation) in travel order, for
+    /// the chart — available before the hike starts too.
+    var elevationProfile: [ElevationSample] {
+        let cumulative = Geo.cumulativeDistances(travelCoordinates)
+        return zip(cumulative, travelPoints).compactMap { d, p in
+            p.elevation.map { ElevationSample(distance: d, elevation: $0) }
+        }
+    }
+    var routeTotalDistance: Double { route?.totalDistance ?? 0 }
+
     // MARK: Loading
 
     func load(from url: URL) {

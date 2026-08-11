@@ -10,6 +10,8 @@ struct ContentView: View {
     @State private var showingImporter = false
     @State private var simulate = true          // dev default: drag-to-walk
     @State private var following = true         // auto-recenter on the walker
+    @State private var showStopConfirm = false
+    @State private var showWalkList = false
 
     private var gpxType: UTType { UTType(importedAs: "com.topografix.gpx") }
 
@@ -75,8 +77,34 @@ struct ContentView: View {
                      onUserPan: { following = false })
             .ignoresSafeArea()
             .overlay(alignment: .top) { junctionHUD }
-            .overlay(alignment: .topTrailing) { recenterButton }
+            .overlay(alignment: .topLeading) { recenterButton }
+            .overlay(alignment: .topTrailing) { stopIcon }
             .overlay(alignment: .bottom) { floatingControls }
+            .alert("End this hike?", isPresented: $showStopConfirm) {
+                Button("End hike", role: .destructive) { hike.stop() }
+                Button("Keep hiking", role: .cancel) {}
+            }
+            .sheet(isPresented: $showWalkList) {
+                WalkListView(store: hike.walkStore)
+            }
+    }
+
+    /// Small stop control at the top-right.
+    @ViewBuilder private var stopIcon: some View {
+        if hike.isActive {
+            Button { showStopConfirm = true } label: {
+                Image(systemName: "stop.circle.fill")
+                    .font(.system(size: 32))
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(.white, .red)
+                    .shadow(radius: 2)
+                    .padding(10)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.trailing, 8)
+            .padding(.top, 2)
+        }
     }
 
     /// Big next-junction indicator across the top: maneuver arrow, "Keep left",
@@ -96,7 +124,7 @@ struct ContentView: View {
             }
             .padding(20)
             .frame(maxWidth: .infinity)
-            .background(.blue.opacity(0.92), in: RoundedRectangle(cornerRadius: 18))
+            .background(.blue.opacity(0.7), in: RoundedRectangle(cornerRadius: 18))
             .foregroundStyle(.white)
             .shadow(radius: 5)
             .padding(.horizontal, 10)
@@ -129,88 +157,136 @@ struct ContentView: View {
     /// The bottom controls, floated over the map (no opaque panel). A soft
     /// gradient scrim + forced dark colours keep the text legible on the map.
     @ViewBuilder private var floatingControls: some View {
-        Group {
-            switch hike.phase {
-            case .idle:     preStartControls
-            case .active:   activeControls
-            case .finished: finishedControls
-            }
+        switch hike.phase {
+        case .idle:
+            elevationPanel(progress: 0) { preStartControls }
+        case .active:
+            elevationPanel(progress: hike.routeProgress) { activeControls }
+        case .finished:
+            finishedControls
+                .padding()
+                .frame(maxWidth: .infinity)
+                .background(
+                    LinearGradient(colors: [.clear, .black.opacity(0.6)],
+                                   startPoint: .top, endPoint: .bottom)
+                        .ignoresSafeArea()
+                )
+                .environment(\.colorScheme, .dark)
         }
-        .padding()
+    }
+
+    /// The elevation profile filling the bottom, with the phase's controls
+    /// drawn on top as black text with a white glow (legible, no dark panel).
+    private func elevationPanel<Controls: View>(progress: Double,
+                                                @ViewBuilder controls: () -> Controls) -> some View {
+        ZStack(alignment: .bottom) {
+            ElevationProfileView(profile: model.elevationProfile,
+                                 progress: progress,
+                                 total: model.routeTotalDistance)
+                .frame(height: 360)
+                .frame(maxWidth: .infinity)
+                .ignoresSafeArea(edges: .bottom)   // chart touches the very bottom
+                .allowsHitTesting(false)           // let drags pass through to the map
+            controls()
+                .padding(.horizontal)
+                .padding(.bottom, 6)
+        }
         .frame(maxWidth: .infinity)
-        .background(
-            LinearGradient(colors: [.clear, .black.opacity(0.6)],
-                           startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea()
-        )
-        .environment(\.colorScheme, .dark)   // light text over the scrim
+        .environment(\.colorScheme, .light)          // force black text regardless of system theme
     }
 
     // MARK: Pre-start
 
     private var preStartControls: some View {
-        VStack(spacing: 14) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(model.routeName).font(.headline).lineLimit(1)
-                    Text("\(model.distanceKmText) • \(model.markers.count) markers")
-                        .font(.subheadline).foregroundStyle(.secondary)
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                Text(model.distanceKmText).font(.headline)
+                combinedStatus
+                Spacer()
+            }
+            .legibleGlow()
+
+            HStack(spacing: 10) {
+                Button { model.reversed.toggle() } label: {
+                    Label("Reverse", systemImage: "arrow.left.arrow.right").lineLimit(1)
                 }
+                .buttonStyle(.borderedProminent)
+                .tint((model.reversed ? Color.blue : Color.gray).opacity(0.7))
+                .fixedSize()
+                Button { simulate.toggle() } label: {
+                    Label("Simulate", systemImage: "hand.draw").lineLimit(1)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint((simulate ? Color.blue : Color.gray).opacity(0.7))
+                .fixedSize()
                 Spacer()
                 Button { showingImporter = true } label: {
-                    Image(systemName: "square.and.arrow.down")
+                    Label("GPX", systemImage: "square.and.arrow.down").lineLimit(1)
                 }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.gray.opacity(0.7))
+                .fixedSize()
             }
 
-            Toggle(isOn: $model.reversed) {
-                Label("Reverse direction", systemImage: "arrow.left.arrow.right")
-            }
-            Toggle(isOn: $simulate) {
-                Label("Simulate (drag to walk)", systemImage: "hand.draw")
-            }
+            elevationStatus.legibleGlow()
 
-            tileStatus
-            trailStatus
-            elevationStatus
+            HStack(spacing: 8) {
+                if let start = model.travelCoordinates.first {
+                    Menu {
+                        Button { openURL(NavApps.appleMaps(start)) } label: {
+                            Label("Apple Maps", systemImage: "map")
+                        }
+                        if let g = NavApps.googleMaps(start), NavApps.canOpen(g) {
+                            Button { openURL(g) } label: { Label("Google Maps", systemImage: "map") }
+                        }
+                        if let w = NavApps.waze(start), NavApps.canOpen(w) {
+                            Button { openURL(w) } label: { Label("Waze", systemImage: "map") }
+                        }
+                        ShareLink(item: NavApps.shareURL(start)) {
+                            Label("Other apps… (Tesla, etc.)", systemImage: "square.and.arrow.up")
+                        }
+                    } label: {
+                        Label("Navigate", systemImage: "car.fill")
+                            .frame(maxWidth: .infinity)
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.borderedProminent).controlSize(.large)
+                    .tint(Color.teal.opacity(0.7))
+                }
 
-            if let start = model.travelCoordinates.first {
-                Menu {
-                    Button { openURL(NavApps.appleMaps(start)) } label: {
-                        Label("Apple Maps", systemImage: "map")
-                    }
-                    if let g = NavApps.googleMaps(start), NavApps.canOpen(g) {
-                        Button { openURL(g) } label: { Label("Google Maps", systemImage: "map") }
-                    }
-                    if let w = NavApps.waze(start), NavApps.canOpen(w) {
-                        Button { openURL(w) } label: { Label("Waze", systemImage: "map") }
-                    }
-                    ShareLink(item: NavApps.shareURL(start)) {
-                        Label("Other apps… (Tesla, etc.)", systemImage: "square.and.arrow.up")
-                    }
+                Button {
+                    guard let start = model.travelCoordinates.first else { return }
+                    following = true
+                    hike.start(points: model.travelPoints,
+                               name: model.routeName,
+                               startCoordinate: start,
+                               intersections: model.intersections)
                 } label: {
-                    Label("Navigate to start", systemImage: "car.fill")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 11)
-                        .background(RoundedRectangle(cornerRadius: 10).fill(.blue.opacity(0.18)))
-                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.blue, lineWidth: 2))
-                        .foregroundStyle(.white)
+                    Label("Start", systemImage: "play.fill").bold().frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.borderedProminent).controlSize(.large)
+                .tint(Color.blue.opacity(0.7))
+                .disabled(model.travelCoordinates.isEmpty)
             }
-
-            Button {
-                guard let start = model.travelCoordinates.first else { return }
-                following = true
-                hike.start(points: model.travelPoints,
-                           name: model.routeName,
-                           startCoordinate: start,
-                           intersections: model.intersections)
-            } label: {
-                Label("Start hike", systemImage: "play.fill").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent).controlSize(.large)
-            .disabled(model.travelCoordinates.isEmpty)
         }
+    }
+
+    /// Offline-map state + turn count on one line.
+    @ViewBuilder private var combinedStatus: some View {
+        HStack(spacing: 6) {
+            if let p = model.tileProgress {
+                Image(systemName: p.isComplete ? "checkmark.circle.fill" : "arrow.down.circle")
+                    .foregroundStyle(p.isComplete ? .green : .secondary)
+                Text(p.isComplete ? "\(p.total) tiles" : "caching \(p.done)/\(p.total)")
+            }
+            switch model.trailState {
+            case .ready(let c): Text("· \(c) turns")
+            case .loading:      Text("· loading turns…")
+            case .failed:       Text("· no turns")
+            case .idle:         EmptyView()
+            }
+        }
+        .font(.footnote).foregroundStyle(.secondary)
     }
 
     // MARK: Active
@@ -230,18 +306,6 @@ struct ContentView: View {
                 stat("Pace vs calc", hike.paceDeltaText, tint: paceColor)
             }
 
-            if simulate {
-                Label("Drag the blue dot to walk the route.",
-                      systemImage: "hand.point.up.left")
-                    .font(.footnote).foregroundStyle(.secondary)
-            }
-
-            Button(role: .destructive) {
-                hike.stop()
-            } label: {
-                Label("Stop hike", systemImage: "stop.fill").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent).controlSize(.large).tint(.red)
         }
     }
 
@@ -255,15 +319,19 @@ struct ContentView: View {
                 stat("Walked", hike.distanceWalkedText)
                 stat("Climb", hike.elevationGainText)
             }
-            HStack(spacing: 12) {
-                if let url = hike.exportURL {
-                    ShareLink(item: url) {
-                        Label("Export GPX", systemImage: "square.and.arrow.up")
-                            .frame(maxWidth: .infinity)
-                    }.buttonStyle(.borderedProminent)
+            HStack(spacing: 8) {
+                Button { showWalkList = true } label: {
+                    Label("Export GPX", systemImage: "square.and.arrow.up")
+                        .frame(maxWidth: .infinity)
                 }
-                Button("Done") { hike.reset() }
-                    .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                Button { hike.reset() } label: {
+                    Text("Done").bold().frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .tint(.green)
             }
         }
     }
@@ -299,7 +367,7 @@ struct ContentView: View {
                     .font(.footnote).foregroundStyle(.secondary)
             case .ready(let count):
                 Image(systemName: "arrow.triangle.turn.up.right.diamond.fill").foregroundStyle(.green)
-                Text("\(count) trail junctions on route (voice + arrows)")
+                Text("\(count) turns")
                     .font(.footnote).foregroundStyle(.secondary)
             case .failed:
                 Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
@@ -343,6 +411,13 @@ struct ContentView: View {
             Text(value).font(.system(.title3, design: .rounded).weight(.semibold))
                 .foregroundStyle(tint)
             Text(label).font(.caption2).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity)
+        }
+        .frame(maxWidth: .infinity)
+        .legibleGlow()
     }
+}
+
+extension View {
+    /// Subtle white glow so dark text stays legible over the map/chart.
+    func legibleGlow() -> some View { shadow(color: .white.opacity(0.7), radius: 1) }
 }

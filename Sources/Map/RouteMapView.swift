@@ -136,9 +136,13 @@ struct RouteMapView: UIViewRepresentable {
             }
 
             // Auto-recenter on the walker (real walk), preserving the user's
-            // zoom. setCenter keeps the current span, so zoom is untouched.
+            // zoom. Place the walker HIGH on the screen (~10% from the top) so
+            // most of the trail ahead is visible and it clears the bottom chart.
             if autoFollow, following, let walker {
-                map.setCenter(walker, animated: true)
+                let offsetLat = map.region.span.latitudeDelta * 0.4   // walker at ~10% from top
+                let target = CLLocationCoordinate2D(latitude: walker.latitude - offsetLat,
+                                                    longitude: walker.longitude)
+                map.setCenter(target, animated: true)
             }
         }
 
@@ -336,7 +340,7 @@ enum JunctionIcon {
             let mid = circle / 2
             // Discreet dark semi-transparent disc — no outline.
             let discRect = CGRect(x: 2, y: 2, width: circle - 4, height: circle - 4)
-            UIColor.black.withAlphaComponent(0.38).setFill()
+            UIColor.black.withAlphaComponent(0.22).setFill()
             c.fillEllipse(in: discRect)
 
             // Plain white arrow, pointing up then rotated to the compass bearing

@@ -18,7 +18,9 @@ final class HikeSession: ObservableObject {
     @Published private(set) var elevationGain: Double = 0
     @Published private(set) var offTrackMeters: CLLocationDistance = 0
     @Published private(set) var elapsed: TimeInterval = 0
-    @Published private(set) var exportURL: URL?
+
+    /// Persistent history of completed walks.
+    let walkStore = WalkStore()
 
     @Published private(set) var etaCalcText: String = "—"
     @Published private(set) var etaPaceText: String = "—"
@@ -28,6 +30,11 @@ final class HikeSession: ObservableObject {
     // The junction to surface in the top HUD (and later the Lock Screen).
     @Published private(set) var hudJunction: Junction?
     @Published private(set) var hudMeters: Double = 0
+
+    // Elevation profile (whole route) + how far along you are, for the chart.
+    @Published private(set) var elevationProfile: [ElevationSample] = []
+    @Published private(set) var routeProgress: Double = 0
+    var routeTotal: Double { plannedCumulative.last ?? 0 }
 
     private let elevationNoiseFloor = 1.0
     let offTrailThreshold: CLLocationDistance = 100
@@ -71,13 +78,17 @@ final class HikeSession: ObservableObject {
         tracker = PolylineTracker(points: points)
         plannedCoords = points.map(\.coordinate)
         plannedCumulative = Geo.cumulativeDistances(plannedCoords)
+        elevationProfile = zip(plannedCumulative, points).compactMap { d, p in
+            p.elevation.map { ElevationSample(distance: d, elevation: $0) }
+        }
+        routeProgress = 0
         junctions = RoutePlanner.plan(travelPoints: points, intersections: intersections)
         eta = ETAEngine(travelPoints: points)
         announcedApproach = []; announcedAt = []
 
         recorded = []; breadcrumb = []
         distanceWalked = 0; elevationGain = 0; offTrackMeters = 0; elapsed = 0
-        exportURL = nil; lastElevation = nil; walkerRouteDistance = 0
+        lastElevation = nil; walkerRouteDistance = 0
         etaCalcText = "—"; etaPaceText = "—"; paceDeltaPercent = nil
         lastAnnouncement = nil; hudJunction = nil; hudMeters = 0
         routeName = name
@@ -95,14 +106,18 @@ final class HikeSession: ObservableObject {
         timer?.invalidate(); timer = nil
         audio.stop(); voice.stop(); presenter.end()
         phase = .finished
-        exportURL = GPXExporter.write(track: recorded, name: "\(routeName) (walked)")
+        // Don't save a walk with no distance.
+        if distanceWalked > 0 {
+            walkStore.save(track: recorded, name: "\(routeName) (walked)",
+                           distance: distanceWalked, elevation: elevationGain, duration: elapsed)
+        }
     }
 
     func reset() {
         timer?.invalidate(); timer = nil
         audio.stop(); voice.stop(); presenter.end()
         phase = .idle
-        walker = nil; breadcrumb = []; recorded = []; exportURL = nil
+        walker = nil; breadcrumb = []; recorded = []
     }
 
     // MARK: Position input
@@ -127,7 +142,7 @@ final class HikeSession: ObservableObject {
         breadcrumb.append(coordinate)
         recorded.append(RecordedPoint(coordinate: coordinate, elevation: ele, time: time))
 
-        if let match { walkerRouteDistance = routeDistance(for: match) }
+        if let match { walkerRouteDistance = routeDistance(for: match); routeProgress = walkerRouteDistance }
         audio.update(offTrackMeters: offTrackMeters)
         announceJunctionsIfNeeded()
         updateHUD()
