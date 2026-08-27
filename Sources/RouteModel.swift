@@ -202,7 +202,7 @@ final class RouteModel: ObservableObject {
         let cum = Geo.cumulativeDistances(coords)
         let cacheKey = RestaurantCache.key(for: coords)
         if let cached = RestaurantCache.load(cacheKey) {
-            restaurants = cached
+            restaurants = RestaurantFinder.dedupedByName(cached)   // older caches may hold dupes
             return
         }
         restaurantTask = Task { [weak self] in

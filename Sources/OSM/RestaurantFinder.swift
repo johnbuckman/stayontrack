@@ -56,7 +56,23 @@ enum RestaurantFinder {
                                        lat: lat, lon: lon,
                                        routeDistance: bestDist, offset: best))
         }
-        return out.sorted { $0.routeDistance < $1.routeDistance }
+        return dedupedByName(out.sorted { $0.routeDistance < $1.routeDistance })
+    }
+
+    /// OSM often carries the same eatery as more than one element (a node plus a
+    /// building way, or duplicate imports), so the same name can appear twice.
+    /// Keep the first of each name (the earliest along the route, since the input
+    /// is sorted by `routeDistance`). Case/space-insensitive; unnamed entries are
+    /// kept as-is.
+    static func dedupedByName(_ list: [TrailRestaurant]) -> [TrailRestaurant] {
+        var seen = Set<String>()
+        var out: [TrailRestaurant] = []
+        for r in list {
+            let key = r.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if key.isEmpty { out.append(r); continue }
+            if seen.insert(key).inserted { out.append(r) }
+        }
+        return out
     }
 }
 
