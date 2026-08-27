@@ -9,7 +9,7 @@ final class RouteModel: ObservableObject {
     @Published private(set) var route: GPXRoute?
     @Published private(set) var markers: [DistanceMarker] = []
     @Published var reversed: Bool = false {
-        didSet { recomputeMarkers(); recomputeJunctions() }
+        didSet { recomputeMarkers(); recomputeJunctions(); rebuildETA() }
     }
     @Published var errorMessage: String?
     @Published var tileProgress: TileProgress?
@@ -20,6 +20,14 @@ final class RouteModel: ObservableObject {
     @Published var trailState: TrailNetworkState = .idle
     @Published var intersections: [Intersection] = []
     @Published var junctions: [Junction] = []
+    /// Eateries within ~200 m of the trail, in the route's CANONICAL direction.
+    @Published var restaurants: [TrailRestaurant] = []
+    private var restaurantTask: Task<Void, Never>?
+    /// Hourly temperature forecast covering the hike window.
+    @Published var weather: [WeatherHour] = []
+    private var weatherTask: Task<Void, Never>?
+    /// Grade-adjusted timing model for the current direction (cached).
+    private var routeETA: ETAEngine?
     @Published var trailElapsed: TimeInterval = 0
     @Published var tileEtaSeconds: TimeInterval?
 
@@ -60,12 +68,21 @@ final class RouteModel: ObservableObject {
     }
     var routeTotalDistance: Double { route?.totalDistance ?? 0 }
 
+    init() { restoreLastHike() }
+
     // MARK: Loading
 
+    /// Persisted copy of the last-loaded GPX, restored on next launch.
+    private var lastGPXURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("last-hike.gpx")
+    }
+
     func load(from url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         do {
-            let parsed = try GPXParser.parse(url: url)
-            apply(parsed)
+            load(data: try Data(contentsOf: url))
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -73,19 +90,18 @@ final class RouteModel: ObservableObject {
 
     func load(data: Data) {
         do {
-            apply(try GPXParser.parse(data: data))
+            let parsed = try GPXParser.parse(data: data)
+            try? data.write(to: lastGPXURL, options: .atomic)   // remember for next launch
+            apply(parsed)
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
-    /// Loads the bundled sample hike (handy in the simulator with no share sheet).
-    func loadSample() {
-        guard let url = Bundle.main.url(forResource: "sample", withExtension: "gpx") else {
-            errorMessage = "Sample hike is missing from the app bundle."
-            return
-        }
-        load(from: url)
+    /// Re-open whatever GPX was loaded last time the app ran.
+    func restoreLastHike() {
+        guard route == nil, let data = try? Data(contentsOf: lastGPXURL) else { return }
+        load(data: data)
     }
 
     private func apply(_ parsed: GPXRoute) {
@@ -94,8 +110,11 @@ final class RouteModel: ObservableObject {
         recomputeMarkers()
         recomputeJunctions()        // geometry turns show immediately (pre-Overpass)
         errorMessage = nil
+        rebuildETA()
         startTileDownload(for: parsed)
         startTrailFetch(for: parsed)
+        startRestaurantFetch(for: parsed)
+        startWeatherFetch(for: parsed)
         startElevationFillIfNeeded(for: parsed)
     }
 
@@ -173,6 +192,127 @@ final class RouteModel: ObservableObject {
         }
     }
 
+    /// Nearby eateries (within ~200 m of the trail), cached per-route for
+    /// offline use. Computed in the route's canonical direction.
+    private func startRestaurantFetch(for route: GPXRoute) {
+        restaurantTask?.cancel()
+        restaurants = []
+        let coords = route.coordinates
+        guard coords.count > 1 else { return }
+        let cum = Geo.cumulativeDistances(coords)
+        let cacheKey = RestaurantCache.key(for: coords)
+        if let cached = RestaurantCache.load(cacheKey) {
+            restaurants = cached
+            return
+        }
+        restaurantTask = Task { [weak self] in
+            let found = await RestaurantFinder.fetch(coords: coords, cumulative: cum)
+            guard let self, !Task.isCancelled else { return }
+            RestaurantCache.save(cacheKey, found)
+            self.restaurants = found
+        }
+    }
+
+    /// Restaurants with `routeDistance` expressed in the CURRENT travel
+    /// direction (flips when Reverse is on), sorted by how soon you reach them.
+    var travelRestaurants: [TrailRestaurant] {
+        guard reversed, let total = route?.totalDistance else {
+            return restaurants
+        }
+        return restaurants.map { r in
+            var m = r; m.routeDistance = max(0, total - r.routeDistance); return m
+        }.sorted { $0.routeDistance < $1.routeDistance }
+    }
+
+    enum AltState: Equatable { case idle, working, failed(String) }
+    @Published var altState: AltState = .idle
+    private var altTask: Task<Void, Never>?
+
+    /// Compute an alternative route (shorter / longer / avoid-steep) over the OSM
+    /// walking graph between this hike's start and finish, and adopt it as the
+    /// current route on success. Runs at the pre-start screen (needs network).
+    func computeAlternative(mode: AlternativeMode) {
+        guard let route else { return }
+        altTask?.cancel()
+        altState = .working
+        let coords = route.coordinates                 // canonical start→finish
+        let label: String = {
+            switch mode {
+            case .shorter: return "shorter"
+            case .longer: return "longer"
+            case .avoidSteep: return "gentler"
+            }
+        }()
+        altTask = Task { [weak self] in
+            do {
+                let alt = try await AlternativeRouteEngine.alternative(for: coords, mode: mode)
+                guard let self, !Task.isCancelled else { return }
+                let points = alt.map { GPXPoint(coordinate: $0, elevation: nil) }
+                self.apply(GPXRoute(name: "\(self.routeName) (\(label))", points: points))
+                self.altState = .idle
+            } catch {
+                guard let self, !Task.isCancelled else { return }
+                self.altState = .failed(Self.altMessage(error))
+            }
+        }
+    }
+
+    private static func altMessage(_ error: Error) -> String {
+        switch error {
+        case AlternativeRouteEngine.EngineError.tooLarge:
+            return "This area is too large to compute a gentler route offline."
+        case AlternativeRouteEngine.EngineError.noGraph:
+            return "Couldn't fetch the trail network — check your connection."
+        default:
+            return "No alternative route found between the start and finish."
+        }
+    }
+
+    private func rebuildETA() {
+        let points = travelPoints
+        routeETA = points.count > 1 ? ETAEngine(travelPoints: points) : nil
+    }
+
+    /// Predicted grade-adjusted seconds from the start to a point `d` metres
+    /// along the route (in the current travel direction).
+    func predictedSeconds(toDistance d: Double) -> Double {
+        routeETA?.expectedTime(toDistance: d) ?? 0
+    }
+
+    /// Forecast temperature (°C) at a given clock time, linearly interpolated.
+    func temperature(at date: Date) -> Double? {
+        guard !weather.isEmpty else { return nil }
+        if date <= weather.first!.time { return weather.first!.tempC }
+        if date >= weather.last!.time { return weather.last!.tempC }
+        for i in 1..<weather.count where weather[i].time >= date {
+            let a = weather[i - 1], b = weather[i]
+            let span = b.time.timeIntervalSince(a.time)
+            let t = span > 0 ? date.timeIntervalSince(a.time) / span : 0
+            return a.tempC + (b.tempC - a.tempC) * t
+        }
+        return weather.last?.tempC
+    }
+
+    /// Forecast for the hike, keyed by the route midpoint + calendar day so it
+    /// refreshes daily and works offline once fetched.
+    private func startWeatherFetch(for route: GPXRoute) {
+        weatherTask?.cancel()
+        weather = []
+        let coords = route.coordinates
+        guard !coords.isEmpty else { return }
+        let mid = coords[coords.count / 2]
+        let df = DateFormatter(); df.dateFormat = "yyyyMMdd"
+        let day = df.string(from: Date())
+        let key = WeatherCache.key(lat: mid.latitude, lon: mid.longitude, dayStamp: day)
+        if let cached = WeatherCache.load(key) { weather = cached; return }
+        weatherTask = Task { [weak self] in
+            let hours = await WeatherClient.fetch(lat: mid.latitude, lon: mid.longitude)
+            guard let self, !Task.isCancelled, !hours.isEmpty else { return }
+            WeatherCache.save(key, hours)
+            self.weather = hours
+        }
+    }
+
     /// Pre-caches the OSM tile corridor so the map works offline on the hike.
     private func startTileDownload(for route: GPXRoute) {
         downloadTask?.cancel()
@@ -213,5 +353,34 @@ final class RouteModel: ObservableObject {
     var distanceKmText: String {
         guard let route else { return "—" }
         return String(format: "%.2f km", route.totalDistance / 1000.0)
+    }
+
+    /// Total elevation gain of the planned route (sum of positive climbs, using
+    /// the same 1 m noise floor as the live hike so pre- and in-hike numbers
+    /// agree). Nil until elevation is available.
+    var routeElevationGain: Double? {
+        let eles = travelPoints.compactMap(\.elevation)
+        guard eles.count > 1 else { return nil }
+        var gain = 0.0
+        for i in 1..<eles.count {
+            let climb = eles[i] - eles[i - 1]
+            if climb > 1.0 { gain += climb }
+        }
+        return gain
+    }
+
+    var elevationGainText: String? {
+        routeElevationGain.map { String(format: "%.0f m ascent", $0) }
+    }
+
+    /// Grade-adjusted estimated time to walk the whole route, formatted h:mm.
+    /// Uses the same Tobler model as the in-hike "calc" ETA.
+    var estimatedDurationText: String? {
+        let points = travelPoints
+        guard points.count > 1 else { return nil }
+        let seconds = ETAEngine(travelPoints: points).calculatedRemaining(fromDistance: 0)
+        guard seconds > 0 else { return nil }
+        let total = Int(seconds.rounded())
+        return String(format: "%d:%02d", total / 3600, (total % 3600) / 60)
     }
 }

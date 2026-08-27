@@ -5,12 +5,48 @@ import MapKit
 /// Personal-use app, so this points at John.
 let osmUserAgent = "StayOnTrack/0.1 (+https://github.com/johnbuckman/stayontrack)"
 
-/// On-disk tile cache at Caches/OSMTiles/z/x/y.png.
+/// On-disk tile cache at Application Support/OSMTiles/z/x/y.png.
+///
+/// Deliberately NOT in Caches: iOS may purge `.cachesDirectory` under storage
+/// pressure, which would silently drop tiles a hiker needs offline. Application
+/// Support survives app restarts and low-storage eviction, so tiles downloaded
+/// for a route (or warmed by panning a frequently-hiked area) stay available.
+/// One-time migration moves any tiles left behind in the old Caches location.
 enum TileStore {
     static let root: URL = {
-        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        return base.appendingPathComponent("OSMTiles", isDirectory: true)
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("OSMTiles", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        migrateFromCachesIfNeeded(to: dir)
+        excludeFromBackup(dir)   // tiles are re-downloadable; keep them out of iCloud/iTunes backups
+        return dir
     }()
+
+    /// Move a pre-existing Caches/OSMTiles cache into Application Support once,
+    /// so upgrading users keep their already-downloaded tiles.
+    private static func migrateFromCachesIfNeeded(to dir: URL) {
+        let old = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("OSMTiles", isDirectory: true)
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: old.path) else { return }
+        // Move each top-level zoom folder across; ignore anything already present.
+        if let entries = try? fm.contentsOfDirectory(at: old, includingPropertiesForKeys: nil) {
+            for entry in entries {
+                let dest = dir.appendingPathComponent(entry.lastPathComponent)
+                if !fm.fileExists(atPath: dest.path) {
+                    try? fm.moveItem(at: entry, to: dest)
+                }
+            }
+        }
+        try? fm.removeItem(at: old)
+    }
+
+    private static func excludeFromBackup(_ url: URL) {
+        var url = url
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? url.setResourceValues(values)
+    }
 
     static func fileURL(_ t: TileCoord) -> URL {
         root.appendingPathComponent("\(t.z)/\(t.x)/\(t.y).png")

@@ -40,6 +40,28 @@ final class HikeSession: ObservableObject {
     let offTrailThreshold: CLLocationDistance = 100
     private let paceReadyAfter: TimeInterval = 600   // withhold pace-ETA for 10 min
 
+    // Off-trail spoken distances (replaces the old rising-pitch tone).
+    private let offTrailBands: [Double] = [20, 50, 100]
+    private var offTrailBandAnnounced = 0             // highest band spoken; resets near trail
+    private var strayOutstanding = false              // spoke off-trail/wrong-turn, not yet back
+
+    // Auto-stop guards.
+    private let autoStopEndRadius: CLLocationDistance = 10       // within 10 m of the finish…
+    private let autoStopMinElapsed: TimeInterval = 20 * 60       // …but only after 20 min hiking
+    private let carSpeed: CLLocationDistance = 20_000 / 3600     // 20 km/h in m/s
+    private let carSustain: TimeInterval = 60                    // sustained for a minute → in a car
+    private var fastSince: Date?
+    private var lastFixTime: Date?
+
+    // "Wrong turn" / repeat-instruction bookkeeping.
+    private var wrongTurnSaid = Set<Int>()           // junctions we've warned a wrong turn past
+    private var repeatAnchor: CLLocationCoordinate2D?
+    private var repeatAnchorSince: Date?
+    private var repeatJunctionIndex: Int?
+
+    /// Called just before an automatic stop so the UI can also stop the GPS.
+    var onAutoStop: (() -> Void)?
+
     private var tracker: PolylineTracker?
     private var recorded: [RecordedPoint] = []
     private var lastElevation: Double?
@@ -55,6 +77,8 @@ final class HikeSession: ObservableObject {
     private var announcedAt = Set<Int>()         // at the junction
     private var eta: ETAEngine?
     private var walkerRouteDistance: CLLocationDistance = 0
+    private var reversed = false                 // route direction, for the resume checkpoint
+    private var fixesSinceCheckpoint = 0         // throttle checkpoint writes
 
     // Feedback
     private let audio = HikeAudio()
@@ -66,6 +90,7 @@ final class HikeSession: ObservableObject {
     }()
 
     var isActive: Bool { phase == .active }
+    var startedAt: Date? { startDate }
     var isOffTrail: Bool { offTrackMeters > offTrailThreshold }
     var junctionCount: Int { junctions.count }
 
@@ -74,7 +99,10 @@ final class HikeSession: ObservableObject {
     func start(points: [GPXPoint],
                name: String,
                startCoordinate: CLLocationCoordinate2D,
-               intersections: [Intersection]) {
+               intersections: [Intersection],
+               reversed: Bool = false) {
+        self.reversed = reversed
+        fixesSinceCheckpoint = 0
         tracker = PolylineTracker(points: points)
         plannedCoords = points.map(\.coordinate)
         plannedCumulative = Geo.cumulativeDistances(plannedCoords)
@@ -85,6 +113,8 @@ final class HikeSession: ObservableObject {
         junctions = RoutePlanner.plan(travelPoints: points, intersections: intersections)
         eta = ETAEngine(travelPoints: points)
         announcedApproach = []; announcedAt = []
+        offTrailBandAnnounced = 0; fastSince = nil; lastFixTime = nil; strayOutstanding = false
+        wrongTurnSaid = []; repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
 
         recorded = []; breadcrumb = []
         distanceWalked = 0; elevationGain = 0; offTrackMeters = 0; elapsed = 0
@@ -100,12 +130,64 @@ final class HikeSession: ObservableObject {
         presenter.begin(routeName: name)
         ingest(coordinate: startCoordinate, elevation: nil, time: Date())
         startTimer()
+        saveCheckpoint()
+    }
+
+    /// Reconstruct a hike that was interrupted (crash / kill) from its
+    /// checkpoint, so tracking, stats, voice and ETA continue where they were.
+    /// Replays no audio — it restores the aggregate state directly.
+    func resume(points: [GPXPoint],
+                name: String,
+                intersections: [Intersection],
+                from cp: HikeCheckpoint) {
+        reversed = cp.reversed
+        fixesSinceCheckpoint = 0
+        tracker = PolylineTracker(points: points)
+        plannedCoords = points.map(\.coordinate)
+        plannedCumulative = Geo.cumulativeDistances(plannedCoords)
+        elevationProfile = zip(plannedCumulative, points).compactMap { d, p in
+            p.elevation.map { ElevationSample(distance: d, elevation: $0) }
+        }
+        junctions = RoutePlanner.plan(travelPoints: points, intersections: intersections)
+        eta = ETAEngine(travelPoints: points)
+
+        recorded = cp.recorded.map(\.recordedPoint)
+        breadcrumb = recorded.map(\.coordinate)
+        distanceWalked = cp.distanceWalked
+        elevationGain = cp.elevationGain
+        offTrackMeters = cp.offTrackMeters
+        walkerRouteDistance = cp.walkerRouteDistance
+        routeProgress = walkerRouteDistance
+        lastElevation = cp.lastElevation
+        routeName = name
+        startDate = cp.startDate
+        walker = breadcrumb.last
+        elapsed = Date().timeIntervalSince(cp.startDate)
+
+        offTrailBandAnnounced = 0; fastSince = nil; lastFixTime = nil; strayOutstanding = false
+        wrongTurnSaid = []; repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
+
+        // Don't re-announce junctions we've already walked past.
+        announcedApproach = []; announcedAt = []
+        for (index, j) in junctions.enumerated() {
+            if walkerRouteDistance >= j.routeDistance - 50 { announcedApproach.insert(index) }
+            if walkerRouteDistance >= j.routeDistance - 12 { announcedAt.insert(index) }
+        }
+
+        phase = .active
+        audio.startEngineIfNeeded()
+        presenter.begin(routeName: name)
+        updateHUD()
+        updateETAs()
+        startTimer()
+        saveCheckpoint()
     }
 
     func stop() {
         timer?.invalidate(); timer = nil
         audio.stop(); voice.stop(); presenter.end()
         phase = .finished
+        HikeCheckpointStore.clear()
         // Don't save a walk with no distance.
         if distanceWalked > 0 {
             walkStore.save(track: recorded, name: "\(routeName) (walked)",
@@ -118,6 +200,25 @@ final class HikeSession: ObservableObject {
         audio.stop(); voice.stop(); presenter.end()
         phase = .idle
         walker = nil; breadcrumb = []; recorded = []
+        HikeCheckpointStore.clear()
+    }
+
+    /// Persist a crash-recovery snapshot. Cheap enough to call often, but
+    /// throttled from `ingest` so it isn't written on literally every GPS fix.
+    private func saveCheckpoint() {
+        guard phase == .active, let startDate else { return }
+        HikeCheckpointStore.save(HikeCheckpoint(
+            routeName: routeName,
+            reversed: reversed,
+            startDate: startDate,
+            savedAt: Date(),
+            distanceWalked: distanceWalked,
+            elevationGain: elevationGain,
+            offTrackMeters: offTrackMeters,
+            walkerRouteDistance: walkerRouteDistance,
+            lastElevation: lastElevation,
+            recorded: recorded.map(HikeCheckpoint.Fix.init)
+        ))
     }
 
     // MARK: Position input
@@ -143,10 +244,21 @@ final class HikeSession: ObservableObject {
         recorded.append(RecordedPoint(coordinate: coordinate, elevation: ele, time: time))
 
         if let match { walkerRouteDistance = routeDistance(for: match); routeProgress = walkerRouteDistance }
-        audio.update(offTrackMeters: offTrackMeters)
         announceJunctionsIfNeeded()
         updateHUD()
         updateETAs()
+        updateOffTrailSpeech()
+        checkWrongTurn()
+        checkStalledAtJunction(coordinate: coordinate, time: time)
+        checkAutoStop(coordinate: coordinate, time: time)
+        guard phase == .active else { return }   // an auto-stop may have ended the hike
+
+        // Checkpoint every few fixes so a crash loses at most a few seconds.
+        fixesSinceCheckpoint += 1
+        if fixesSinceCheckpoint >= 5 {
+            fixesSinceCheckpoint = 0
+            saveCheckpoint()
+        }
     }
 
     private func routeDistance(for match: PolylineTracker.Match) -> CLLocationDistance {
@@ -160,19 +272,117 @@ final class HikeSession: ObservableObject {
 
     private func announceJunctionsIfNeeded() {
         guard offTrackMeters < 60 else { return }   // don't call turns while well off-route
-        // Minimal cue ("Keep left") twice: ~50 m before, then at the junction.
+        // One cue only, spoken once we're within 7 m of the junction (down from
+        // the old two-stage 50 m + 12 m announcements).
         for (index, j) in junctions.enumerated() {
-            if !announcedApproach.contains(index), walkerRouteDistance >= j.routeDistance - 50 {
-                announcedApproach.insert(index)
-                lastAnnouncement = j.spoken
-                voice.speak(j.spoken)
-            }
-            if !announcedAt.contains(index), walkerRouteDistance >= j.routeDistance - 12 {
+            if !announcedAt.contains(index),
+               abs(walkerRouteDistance - j.routeDistance) <= 7 {
                 announcedAt.insert(index)
                 lastAnnouncement = j.spoken
                 voice.speak(j.spoken)
             }
         }
+    }
+
+    /// Speak "20 / 50 / 100 meters off trail" as you stray further (each band
+    /// once), and reset once you're essentially back on the trail. Replaces the
+    /// old off-trail tone, which John found unhelpful.
+    private func updateOffTrailSpeech() {
+        // Back within 5 m after having strayed → confirm you're back on trail.
+        if offTrackMeters < 5 {
+            offTrailBandAnnounced = 0
+            if strayOutstanding {
+                strayOutstanding = false
+                lastAnnouncement = "Back on trail"
+                voice.speak("Back on trail")
+            }
+            return
+        }
+        if offTrackMeters < 10 {
+            offTrailBandAnnounced = 0
+            return
+        }
+        var band = 0
+        for (i, threshold) in offTrailBands.enumerated() where offTrackMeters >= threshold {
+            band = i + 1
+        }
+        if band > offTrailBandAnnounced {
+            offTrailBandAnnounced = band
+            strayOutstanding = true
+            let meters = Int(offTrailBands[band - 1])
+            voice.speak("\(meters) meters off trail")
+        }
+    }
+
+    /// After walking past a junction, if we've drifted more than 20 m off the
+    /// trail, say "wrong turn" once for that junction.
+    private func checkWrongTurn() {
+        guard offTrackMeters > 20 else { return }
+        for (index, j) in junctions.enumerated()
+        where walkerRouteDistance >= j.routeDistance
+                && walkerRouteDistance <= j.routeDistance + 60
+                && !wrongTurnSaid.contains(index) {
+            wrongTurnSaid.insert(index)
+            strayOutstanding = true
+            lastAnnouncement = "Wrong turn"
+            voice.speak("Wrong turn")
+        }
+    }
+
+    /// If you stall at a junction (haven't moved 5 m for 10 s while one is right
+    /// in front of you), repeat its turn instruction.
+    private func checkStalledAtJunction(coordinate: CLLocationCoordinate2D, time: Date) {
+        guard let j = hudJunction, hudMeters <= 15,
+              let index = junctions.firstIndex(where: { $0.routeDistance == j.routeDistance }) else {
+            repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
+            return
+        }
+        if repeatJunctionIndex != index || repeatAnchor == nil {
+            repeatAnchor = coordinate; repeatAnchorSince = time; repeatJunctionIndex = index
+            return
+        }
+        let moved = CLLocation(from: repeatAnchor!).distance(from: CLLocation(from: coordinate))
+        if moved > 5 {
+            repeatAnchor = coordinate; repeatAnchorSince = time
+        } else if let since = repeatAnchorSince, time.timeIntervalSince(since) >= 10 {
+            repeatAnchorSince = time                  // don't spam; wait another 10 s
+            lastAnnouncement = j.spoken
+            voice.speak(j.spoken)
+        }
+    }
+
+    /// Automatic stops: near the finish (after a real hike), or when we've
+    /// clearly jumped into a car and forgot to end the hike.
+    private func checkAutoStop(coordinate: CLLocationCoordinate2D, time: Date) {
+        // Speed since the previous fix.
+        if let prev = lastFixTime {
+            let dt = time.timeIntervalSince(prev)
+            if dt > 0, let last = breadcrumb.dropLast().last {
+                let d = CLLocation(from: last).distance(from: CLLocation(from: coordinate))
+                let speed = d / dt
+                if speed > carSpeed {
+                    if fastSince == nil { fastSince = prev }
+                    if let s = fastSince, time.timeIntervalSince(s) >= carSustain {
+                        autoStop(); return
+                    }
+                } else {
+                    fastSince = nil
+                }
+            }
+        }
+        lastFixTime = time
+
+        // Near the finish, but only after a genuine hike (start and end can be
+        // metres apart on a loop, so don't fire in the first 20 minutes).
+        if elapsed >= autoStopMinElapsed, let end = plannedCoords.last {
+            let toEnd = CLLocation(from: coordinate).distance(from: CLLocation(from: end))
+            if toEnd <= autoStopEndRadius { autoStop() }
+        }
+    }
+
+    private func autoStop() {
+        onAutoStop?()
+        stop()
     }
 
     // MARK: HUD — the next junction and distance to it
@@ -199,6 +409,8 @@ final class HikeSession: ObservableObject {
         let now = Date()
         let calcRemaining = eta.calculatedRemaining(fromDistance: walkerRouteDistance)
         etaCalcText = clock.string(from: now.addingTimeInterval(calcRemaining))
+        let secs = Int(calcRemaining.rounded())
+        timeLeftText = String(format: "%d:%02d", secs / 3600, (secs % 3600) / 60)
 
         if elapsed >= paceReadyAfter, distanceWalked > 0 {
             let pace = distanceWalked / elapsed                       // m/s
@@ -214,6 +426,19 @@ final class HikeSession: ObservableObject {
             let expected = eta.expectedTime(toDistance: walkerRouteDistance)
             paceDeltaPercent = expected > 0 ? (expected / elapsed - 1) * 100 : nil
         }
+    }
+
+    /// Grade-adjusted time remaining to the finish, as h:mm — the "time left in
+    /// hike" HUD value.
+    @Published private(set) var timeLeftText: String = "—"
+
+    /// Predicted clock time you'll pass a point `d` metres along the route
+    /// (grade-adjusted). Nil if it's behind you or the hike isn't running.
+    func arrivalClock(atRouteDistance d: Double) -> String? {
+        guard let eta, phase == .active, d >= walkerRouteDistance else { return nil }
+        let remaining = eta.expectedTime(toDistance: d) - eta.expectedTime(toDistance: walkerRouteDistance)
+        guard remaining > 0 else { return nil }
+        return clock.string(from: Date().addingTimeInterval(remaining))
     }
 
     var paceDeltaText: String {

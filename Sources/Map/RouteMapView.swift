@@ -9,6 +9,7 @@ struct RouteMapView: UIViewRepresentable {
     let coordinates: [CLLocationCoordinate2D]
     let markers: [DistanceMarker]
     var junctions: [Junction] = []
+    var restaurants: [TrailRestaurant] = []
     var walker: CLLocationCoordinate2D?
     var breadcrumb: [CLLocationCoordinate2D] = []
     var simulating: Bool = false
@@ -17,6 +18,13 @@ struct RouteMapView: UIViewRepresentable {
     var autoFollow: Bool = false
     var following: Bool = true
     var onUserPan: (() -> Void)?
+    /// Per-point elevations (metres) aligned to `coordinates`, for grade-based
+    /// line width. Empty → the route draws at a single uniform width.
+    var elevations: [Double?] = []
+    /// Distance walked so far, for the "beyond the next 1 km fades back" effect.
+    var progressDistance: Double = 0
+    /// Device compass heading (true north degrees) → the on-map compass needle.
+    var walkerHeading: Double?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -24,7 +32,7 @@ struct RouteMapView: UIViewRepresentable {
         let map = MKMapView()
         map.delegate = context.coordinator
         map.pointOfInterestFilter = .excludingAll
-        map.isRotateEnabled = false   // keep north up so the arrows read correctly
+        map.isRotateEnabled = true    // two-finger rotate; arrows are heading-compensated below
         map.isPitchEnabled = false
         let overlay = OSMTileOverlay()
         map.addOverlay(overlay, level: .aboveLabels)
@@ -33,6 +41,13 @@ struct RouteMapView: UIViewRepresentable {
                                          action: #selector(Coordinator.handlePan(_:)))
         pan.delegate = context.coordinator
         map.addGestureRecognizer(pan)
+
+        // Three-finger tap resets the map to true north.
+        let resetNorth = UITapGestureRecognizer(target: context.coordinator,
+                                                action: #selector(Coordinator.resetToNorth(_:)))
+        resetNorth.numberOfTouchesRequired = 3
+        map.addGestureRecognizer(resetNorth)
+
         context.coordinator.map = map
         return map
     }
@@ -43,10 +58,14 @@ struct RouteMapView: UIViewRepresentable {
         context.coordinator.autoFollow = autoFollow
         context.coordinator.following = following
         context.coordinator.onUserPan = onUserPan
+        context.coordinator.elevations = elevations
+        context.coordinator.progressDistance = progressDistance
+        context.coordinator.walkerHeading = walkerHeading
         context.coordinator.sync(map,
                                  coordinates: coordinates,
                                  markers: markers,
                                  junctions: junctions,
+                                 restaurants: restaurants,
                                  walker: walker,
                                  breadcrumb: breadcrumb)
     }
@@ -60,19 +79,27 @@ struct RouteMapView: UIViewRepresentable {
         var autoFollow = false
         var following = true
         var onUserPan: (() -> Void)?
+        var elevations: [Double?] = []
+        var progressDistance: Double = 0
+        var walkerHeading: Double?
 
-        private var routePolyline: MKPolyline?
+        private var routeSegments: [MKPolyline] = []
+        private var segmentStyle: [ObjectIdentifier: (width: CGFloat, alpha: CGFloat)] = [:]
         private var breadcrumbPolyline: MKPolyline?
         private let walkerAnnotation = WalkerAnnotation()
         private var walkerAdded = false
         private var lastSignature = ""
+        private var lastProgressBucket = -1
         private var lastMarkerSig = ""
         private var lastJunctionSig = ""
+
+        private var lastRestaurantSig = ""
 
         func sync(_ map: MKMapView,
                   coordinates: [CLLocationCoordinate2D],
                   markers: [DistanceMarker],
                   junctions: [Junction],
+                  restaurants: [TrailRestaurant],
                   walker: CLLocationCoordinate2D?,
                   breadcrumb: [CLLocationCoordinate2D]) {
 
@@ -81,13 +108,14 @@ struct RouteMapView: UIViewRepresentable {
             map.isScrollEnabled = !simulating
 
             let signature = routeSignature(coordinates)
+            // Rebuild the route when it changes, or when the walker has advanced
+            // enough that the "next 1 km" fade window has moved (100 m buckets).
+            let progressBucket = Int(progressDistance / 100)
+            if signature != lastSignature || progressBucket != lastProgressBucket {
+                rebuildRoute(map, coordinates: coordinates)
+                lastProgressBucket = progressBucket
+            }
             if signature != lastSignature {
-                if let old = routePolyline { map.removeOverlay(old) }
-                if coordinates.count > 1 {
-                    let line = MKPolyline(coordinates: coordinates, count: coordinates.count)
-                    map.addOverlay(line, level: .aboveLabels)
-                    routePolyline = line
-                }
                 // START / STOP signs at the route ends (flip with Reverse).
                 let ends = map.annotations.compactMap { $0 as? EndpointAnnotation }
                 map.removeAnnotations(ends)
@@ -117,6 +145,14 @@ struct RouteMapView: UIViewRepresentable {
                 lastJunctionSig = junctionSig
             }
 
+            // Restaurant pins near the trail — rebuild only on change.
+            let restaurantSig = restaurants.map { String($0.id) }.joined(separator: ",")
+            if restaurantSig != lastRestaurantSig {
+                map.removeAnnotations(map.annotations.compactMap { $0 as? RestaurantAnnotation })
+                map.addAnnotations(restaurants.map(RestaurantAnnotation.init))
+                lastRestaurantSig = restaurantSig
+            }
+
             // Faint breadcrumb of the actual walk.
             if let old = breadcrumbPolyline { map.removeOverlay(old) }
             breadcrumbPolyline = nil
@@ -130,20 +166,68 @@ struct RouteMapView: UIViewRepresentable {
             if let walker {
                 walkerAnnotation.coordinate = walker
                 if !walkerAdded { map.addAnnotation(walkerAnnotation); walkerAdded = true }
+                updateWalkerCompass(map)
             } else if walkerAdded {
                 map.removeAnnotation(walkerAnnotation)
                 walkerAdded = false
             }
 
             // Auto-recenter on the walker (real walk), preserving the user's
-            // zoom. Place the walker HIGH on the screen (~10% from the top) so
-            // most of the trail ahead is visible and it clears the bottom chart.
+            // zoom. Keep the current position in the MIDDLE of the screen.
             if autoFollow, following, let walker {
-                let offsetLat = map.region.span.latitudeDelta * 0.4   // walker at ~10% from top
-                let target = CLLocationCoordinate2D(latitude: walker.latitude - offsetLat,
-                                                    longitude: walker.longitude)
-                map.setCenter(target, animated: true)
+                map.setCenter(walker, animated: true)
             }
+        }
+
+        /// Draw the planned route as a series of polylines whose WIDTH encodes
+        /// the local grade: normal (4 px) where flat, thickening LINEARLY up to
+        /// 4× (16 px) at a 25 % grade, at 80 % opacity — and where everything more
+        /// than 1 km ahead of the walker fades back to 50 % so the next kilometre
+        /// stands out. Consecutive segments that share a style are merged to keep
+        /// the overlay count sane.
+        private func rebuildRoute(_ map: MKMapView, coordinates: [CLLocationCoordinate2D]) {
+            map.removeOverlays(routeSegments)
+            routeSegments.removeAll()
+            segmentStyle.removeAll()
+            guard coordinates.count > 1 else { return }
+
+            let cum = Geo.cumulativeDistances(coordinates)
+            let hiking = progressDistance > 0
+
+            func style(at i: Int) -> (widthBucket: Int, alpha: CGFloat) {
+                let d = max(1, cum[i] - cum[i - 1])
+                var grade = 0.0
+                if elevations.count == coordinates.count,
+                   let a = elevations[i - 1], let b = elevations[i] {
+                    grade = abs(b - a) / d
+                }
+                let g = min(grade, 0.25) / 0.25
+                let width = 4.0 * (1.0 + 3.0 * g)                 // 4 px flat → 16 px (4×) at ≥25 %
+                let aheadStart = cum[i - 1] - progressDistance
+                let alpha: CGFloat = (hiking && aheadStart > 1000) ? 0.5 : 0.8
+                return (Int(width.rounded()), alpha)
+            }
+
+            // Merge consecutive segments sharing a (width, alpha) style.
+            var runStart = 0
+            var current = style(at: 1)
+            func emitRun(_ from: Int, _ to: Int, _ s: (widthBucket: Int, alpha: CGFloat)) {
+                let slice = Array(coordinates[from...to])
+                guard slice.count > 1 else { return }
+                let poly = MKPolyline(coordinates: slice, count: slice.count)
+                segmentStyle[ObjectIdentifier(poly)] = (CGFloat(s.widthBucket), s.alpha)
+                routeSegments.append(poly)
+                map.addOverlay(poly, level: .aboveLabels)
+            }
+            for i in 2..<coordinates.count {
+                let s = style(at: i)
+                if s != current {
+                    emitRun(runStart, i - 1, current)
+                    runStart = i - 1
+                    current = s
+                }
+            }
+            emitRun(runStart, coordinates.count - 1, current)
         }
 
         private func fit(_ map: MKMapView, coordinates: [CLLocationCoordinate2D]) {
@@ -177,10 +261,59 @@ struct RouteMapView: UIViewRepresentable {
             }
         }
 
+        /// Three-finger tap → snap the map back to true north.
+        @objc func resetToNorth(_ gesture: UITapGestureRecognizer) {
+            guard let map = gesture.view as? MKMapView else { return }
+            let camera = map.camera.copy() as! MKMapCamera
+            camera.heading = 0
+            map.setCamera(camera, animated: true)
+        }
+
+        /// Junction arrows are baked pointing at their absolute compass bearing
+        /// on a north-up map. When the user rotates the map, counter-rotate those
+        /// views by the map heading so each arrow keeps pointing the true way.
+        private func compensateJunctionHeading(_ map: MKMapView) {
+            let radians = -map.camera.heading * .pi / 180
+            let t = CGAffineTransform(rotationAngle: radians)
+            for annotation in map.annotations where annotation is JunctionAnnotation {
+                map.view(for: annotation)?.transform = t
+            }
+        }
+
+        /// A short red compass needle sticking out of the walker dot in the
+        /// phone's heading direction (only while hiking, and only on hardware
+        /// with a compass). Kept correct as the map is rotated.
+        private func updateWalkerCompass(_ map: MKMapView) {
+            guard let view = map.view(for: walkerAnnotation) else { return }
+            let tag = 7788
+            let container = view.viewWithTag(tag) ?? {
+                let c = UIView(frame: CGRect(x: 0, y: 0, width: 28, height: 28))
+                c.tag = tag
+                c.isUserInteractionEnabled = false
+                c.clipsToBounds = false
+                let needle = UIView(frame: CGRect(x: 13, y: 0, width: 2, height: 14))
+                needle.backgroundColor = .systemRed
+                needle.layer.cornerRadius = 1
+                c.addSubview(needle)
+                view.addSubview(c)
+                return c
+            }()
+            container.center = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+            if let heading = walkerHeading {
+                container.isHidden = false
+                let angle = (heading - map.camera.heading) * .pi / 180
+                container.transform = CGAffineTransform(rotationAngle: angle)
+            } else {
+                container.isHidden = true
+            }
+        }
+
         /// Simulate: drag walks the dot. Real walk: observe pans (alongside the
         /// map's own pan) to know when to stop following. Idle: let the map pan.
         func gestureRecognizerShouldBegin(_ gesture: UIGestureRecognizer) -> Bool {
-            simulating || autoFollow
+            // Let the map's own rotate/pinch recognisers run; only gate our pan.
+            if gesture is UIPanGestureRecognizer { return simulating || autoFollow }
+            return true
         }
 
         func gestureRecognizer(_ g: UIGestureRecognizer,
@@ -189,6 +322,16 @@ struct RouteMapView: UIViewRepresentable {
         }
 
         // MARK: MKMapViewDelegate
+
+        func mapViewDidChangeVisibleRegion(_ map: MKMapView) {
+            compensateJunctionHeading(map)
+            updateWalkerCompass(map)
+        }
+
+        func mapView(_ map: MKMapView, regionDidChangeAnimated animated: Bool) {
+            compensateJunctionHeading(map)
+            updateWalkerCompass(map)
+        }
 
         func mapView(_ map: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let tile = overlay as? MKTileOverlay {
@@ -199,6 +342,9 @@ struct RouteMapView: UIViewRepresentable {
                 if line === breadcrumbPolyline {
                     r.strokeColor = UIColor.systemBlue.withAlphaComponent(0.35)
                     r.lineWidth = 6
+                } else if let s = segmentStyle[ObjectIdentifier(line)] {
+                    r.strokeColor = UIColor.systemBlue.withAlphaComponent(s.alpha)
+                    r.lineWidth = s.width
                 } else {
                     r.strokeColor = .systemBlue
                     r.lineWidth = 4
@@ -237,8 +383,19 @@ struct RouteMapView: UIViewRepresentable {
                 view.annotation = annotation
                 view.image = EndpointSign.image(for: endpoint.kind)
                 view.centerOffset = CGPoint(x: 0, y: -12)   // point sits at the coordinate
+                view.alpha = 0.7   // 30% transparent so overlapping start/stop (loops) are both visible
                 view.canShowCallout = false
                 view.displayPriority = .required
+                return view
+            }
+            if let restaurant = annotation as? RestaurantAnnotation {
+                let id = "restaurant"
+                let view = map.dequeueReusableAnnotationView(withIdentifier: id)
+                    ?? MKAnnotationView(annotation: annotation, reuseIdentifier: id)
+                view.annotation = annotation
+                view.image = RestaurantIcon.image
+                view.centerOffset = CGPoint(x: 0, y: -11)
+                view.canShowCallout = true
                 return view
             }
             if let junction = annotation as? JunctionAnnotation {
@@ -246,7 +403,9 @@ struct RouteMapView: UIViewRepresentable {
                 let view = map.dequeueReusableAnnotationView(withIdentifier: id)
                     ?? MKAnnotationView(annotation: annotation, reuseIdentifier: id)
                 view.annotation = annotation
-                view.transform = .identity   // arrow is baked into the image
+                // Baked to absolute bearing on a north-up map; counter-rotate to
+                // the current map heading so it stays correct when rotated.
+                view.transform = CGAffineTransform(rotationAngle: -map.camera.heading * .pi / 180)
                 view.image = JunctionIcon.image(bearing: junction.outBearing)
                 view.centerOffset = .zero    // disc sits on the junction
                 view.canShowCallout = false
@@ -277,6 +436,29 @@ final class JunctionAnnotation: NSObject, MKAnnotation {
     init(_ j: Junction) {
         coordinate = j.coordinate; outBearing = j.outBearing
     }
+}
+
+final class RestaurantAnnotation: NSObject, MKAnnotation {
+    let coordinate: CLLocationCoordinate2D
+    let name: String
+    init(_ r: TrailRestaurant) { coordinate = r.coordinate; name = r.name }
+    var title: String? { name }
+}
+
+/// A small pin with a fork-and-knife glyph for a trailside eatery.
+enum RestaurantIcon {
+    static let image: UIImage = {
+        let size = CGSize(width: 26, height: 26)
+        return UIGraphicsImageRenderer(size: size).image { ctx in
+            let c = ctx.cgContext
+            let disc = CGRect(x: 1, y: 1, width: 24, height: 24)
+            UIColor.systemOrange.setFill(); c.fillEllipse(in: disc)
+            UIColor.white.setStroke(); c.setLineWidth(1.5); c.strokeEllipse(in: disc)
+            let glyph = UIImage(systemName: "fork.knife")?
+                .withTintColor(.white, renderingMode: .alwaysOriginal)
+            glyph?.draw(in: CGRect(x: 6, y: 6, width: 14, height: 14))
+        }
+    }()
 }
 
 final class EndpointAnnotation: NSObject, MKAnnotation {

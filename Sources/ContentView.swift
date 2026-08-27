@@ -6,12 +6,24 @@ import UIKit
 struct ContentView: View {
     @EnvironmentObject var model: RouteModel
     @StateObject private var hike = HikeSession()
+    @StateObject private var location = LocationProvider()
     @Environment(\.openURL) private var openURL
     @State private var showingImporter = false
-    @State private var simulate = true          // dev default: drag-to-walk
+    // Simulate (drag-to-walk) defaults ON only on the Mac dev build; OFF on iOS.
+    @State private var simulate: Bool = {
+        #if targetEnvironment(macCatalyst)
+        return true
+        #else
+        return false
+        #endif
+    }()
     @State private var following = true         // auto-recenter on the walker
     @State private var showStopConfirm = false
+    @State private var showLocationDenied = false
     @State private var showWalkList = false
+    @State private var showFood = false
+    @State private var pendingResume: HikeCheckpoint?     // crash-recovery offer
+    @State private var checkedForResume = false
 
     private var gpxType: UTType { UTType(importedAs: "com.topografix.gpx") }
 
@@ -38,25 +50,65 @@ struct ContentView: View {
         } message: {
             Text(model.errorMessage ?? "")
         }
+        .task { offerResumeIfInterrupted() }
+        .alert("Resume hike?", isPresented: Binding(get: { pendingResume != nil },
+                                                    set: { if !$0 { pendingResume = nil } })) {
+            Button("Resume") { resumeInterruptedHike() }
+            Button("Discard", role: .destructive) {
+                HikeCheckpointStore.clear(); pendingResume = nil
+            }
+        } message: {
+            if let cp = pendingResume {
+                Text("“\(cp.routeName)” was interrupted after \(String(format: "%.2f km", cp.distanceWalked / 1000)). Pick up where you left off?")
+            }
+        }
+    }
+
+    /// On launch, if a hike was interrupted mid-walk, offer to resume it.
+    private func offerResumeIfInterrupted() {
+        hike.onAutoStop = { location.stop() }        // auto-stop should also drop GPS
+        guard !checkedForResume else { return }
+        checkedForResume = true
+        guard hike.phase == .idle, let cp = HikeCheckpointStore.load() else { return }
+        pendingResume = cp
+    }
+
+    private func resumeInterruptedHike() {
+        guard let cp = pendingResume else { return }
+        model.reversed = cp.reversed                 // rebuild travel points in the saved direction
+        following = true
+        hike.resume(points: model.travelPoints,
+                    name: model.routeName,
+                    intersections: model.intersections,
+                    from: cp)
+        if !simulate {
+            location.onLocation = { coord, elev, time in
+                hike.ingest(coordinate: coord, elevation: elev, time: time)
+            }
+            location.start()
+        }
+        pendingResume = nil
     }
 
     // MARK: Empty state
 
     private var emptyState: some View {
         VStack(spacing: 20) {
-            Image(systemName: "figure.hiking")
-                .font(.system(size: 64)).foregroundStyle(.secondary)
+            Image("AppIconImage")
+                .resizable()
+                .scaledToFit()
+                .frame(width: 110, height: 110)
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .shadow(radius: 5)
             Text("Stay on Track").font(.largeTitle.bold())
             Text("Share or open a GPX hike to get started.")
                 .foregroundStyle(.secondary)
-            VStack(spacing: 12) {
-                Button { showingImporter = true } label: {
-                    Label("Import GPX", systemImage: "square.and.arrow.down")
-                        .frame(maxWidth: .infinity)
-                }.buttonStyle(.borderedProminent)
-                Button("Load sample hike") { model.loadSample() }
-                    .buttonStyle(.bordered)
-            }.padding(.horizontal, 40)
+            Button { showingImporter = true } label: {
+                Label("Import GPX", systemImage: "square.and.arrow.down")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.horizontal, 40)
         }.padding()
     }
 
@@ -66,6 +118,7 @@ struct ContentView: View {
         RouteMapView(coordinates: model.travelCoordinates,
                      markers: model.markers,
                      junctions: model.junctions,
+                     restaurants: model.restaurants,
                      walker: hike.walker,
                      breadcrumb: hike.breadcrumb,
                      simulating: simulate && hike.isActive,
@@ -74,19 +127,85 @@ struct ContentView: View {
                      },
                      autoFollow: hike.isActive && !simulate,
                      following: following,
-                     onUserPan: { following = false })
+                     onUserPan: { following = false },
+                     elevations: model.travelPoints.map(\.elevation),
+                     progressDistance: hike.isActive ? hike.routeProgress : 0,
+                     walkerHeading: hike.isActive && !simulate ? location.heading : nil)
             .ignoresSafeArea()
             .overlay(alignment: .top) { junctionHUD }
             .overlay(alignment: .topLeading) { recenterButton }
             .overlay(alignment: .topTrailing) { stopIcon }
+            .overlay(alignment: .topTrailing) { calculatingBadge }
             .overlay(alignment: .bottom) { floatingControls }
+            .overlay { researchingOverlay }
             .alert("End this hike?", isPresented: $showStopConfirm) {
-                Button("End hike", role: .destructive) { hike.stop() }
+                Button("End hike", role: .destructive) { location.stop(); hike.stop() }
                 Button("Keep hiking", role: .cancel) {}
             }
             .sheet(isPresented: $showWalkList) {
                 WalkListView(store: hike.walkStore)
             }
+            .sheet(isPresented: $showFood) {
+                RestaurantListView(restaurants: model.travelRestaurants,
+                                   etaIntoHike: { d in
+                                       let s = model.predictedSeconds(toDistance: d)
+                                       guard s > 0 else { return nil }
+                                       let t = Int(s.rounded())
+                                       return String(format: "%d:%02d", t / 3600, (t % 3600) / 60)
+                                   })
+            }
+            .onChange(of: location.denied) { _, denied in
+                if denied { showLocationDenied = true }
+            }
+            .alert("Location access needed", isPresented: $showLocationDenied) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Turn on Location for Stay on Track in Settings so it can follow your hike — or use the Simulate button to walk the route by dragging.")
+            }
+            .alert("Couldn't find a route",
+                   isPresented: Binding(get: { if case .failed = model.altState { return true } else { return false } },
+                                        set: { if !$0 { model.altState = .idle } })) {
+                Button("OK", role: .cancel) { model.altState = .idle }
+            } message: {
+                if case .failed(let msg) = model.altState { Text(msg) }
+            }
+    }
+
+    /// Top-right badge shown while the OSM turn network is still being fetched:
+    /// says it's calculating and shows the live elapsed timer.
+    @ViewBuilder private var calculatingBadge: some View {
+        if model.trailState == .loading {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text(String(format: "Calculating turns… %.1fs", model.trailElapsed))
+                    .font(.caption.weight(.semibold)).monospacedDigit()
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+            .shadow(radius: 2)
+            .padding(8)
+        }
+    }
+
+    /// Modal "thinking" popup while an alternative route is being computed.
+    @ViewBuilder private var researchingOverlay: some View {
+        if model.altState == .working {
+            ZStack {
+                Color.black.opacity(0.35).ignoresSafeArea()
+                VStack(spacing: 14) {
+                    ProgressView().controlSize(.large)
+                    Text("Researching route…").font(.headline)
+                    Text("Finding a walkable path between the start and finish.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(28)
+                .frame(maxWidth: 280)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .shadow(radius: 12)
+            }
+            .transition(.opacity)
+        }
     }
 
     /// Small stop control at the top-right.
@@ -123,11 +242,10 @@ struct ContentView: View {
                 Spacer()
             }
             .padding(20)
-            .frame(maxWidth: .infinity)
+            .containerRelativeFrame(.horizontal) { width, _ in width * 0.5 }
             .background(.blue.opacity(0.7), in: RoundedRectangle(cornerRadius: 18))
             .foregroundStyle(.white)
             .shadow(radius: 5)
-            .padding(.horizontal, 10)
             .padding(.top, 12)
         }
     }
@@ -139,19 +257,31 @@ struct ContentView: View {
 
     /// Shown when a real walk is in progress but the user has panned away.
     @ViewBuilder private var recenterButton: some View {
-        if hike.isActive && !simulate && !following {
-            Button {
-                following = true
-            } label: {
-                Label("Recenter", systemImage: "location.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(.horizontal, 12).padding(.vertical, 8)
-                    .background(.blue, in: Capsule())
-                    .foregroundStyle(.white)
-                    .shadow(radius: 3)
+        VStack(alignment: .leading, spacing: 10) {
+            if hike.isActive && !simulate && !following {
+                Button {
+                    following = true
+                } label: {
+                    Label("Recenter", systemImage: "location.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(.blue, in: Capsule())
+                        .foregroundStyle(.white)
+                        .shadow(radius: 3)
+                }
             }
-            .padding()
+            if !model.restaurants.isEmpty {
+                Button { showFood = true } label: {
+                    Label("\(model.restaurants.count)", systemImage: "fork.knife")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(.orange, in: Capsule())
+                        .foregroundStyle(.white)
+                        .shadow(radius: 3)
+                }
+            }
         }
+        .padding()
     }
 
     /// The bottom controls, floated over the map (no opaque panel). A soft
@@ -182,7 +312,9 @@ struct ContentView: View {
         ZStack(alignment: .bottom) {
             ElevationProfileView(profile: model.elevationProfile,
                                  progress: progress,
-                                 total: model.routeTotalDistance)
+                                 total: model.routeTotalDistance,
+                                 temperatures: temperatureProfile,
+                                 sampleTimes: timeProfile)
                 .frame(height: 360)
                 .frame(maxWidth: .infinity)
                 .ignoresSafeArea(edges: .bottom)   // chart touches the very bottom
@@ -195,6 +327,28 @@ struct ContentView: View {
         .environment(\.colorScheme, .light)          // force black text regardless of system theme
     }
 
+    /// Forecast temperature at each elevation sample, resolved to the clock time
+    /// you're predicted to be there (anchored to the real start once hiking, so
+    /// it adjusts as the walk progresses). Empty until a forecast has loaded.
+    private var temperatureProfile: [Double?] {
+        guard !model.weather.isEmpty else { return [] }
+        let departure = hike.startedAt ?? Date()
+        return model.elevationProfile.map { sample in
+            let when = departure.addingTimeInterval(model.predictedSeconds(toDistance: sample.distance))
+            return model.temperature(at: when)
+        }
+    }
+
+    /// Predicted clock time at each elevation sample (same departure anchor as
+    /// `temperatureProfile`), for the per-hour temperature labels.
+    private var timeProfile: [Date?] {
+        guard !model.weather.isEmpty else { return [] }
+        let departure = hike.startedAt ?? Date()
+        return model.elevationProfile.map { sample in
+            departure.addingTimeInterval(model.predictedSeconds(toDistance: sample.distance))
+        }
+    }
+
     // MARK: Pre-start
 
     private var preStartControls: some View {
@@ -204,6 +358,18 @@ struct ContentView: View {
                 combinedStatus
                 Spacer()
             }
+            .legibleGlow()
+
+            HStack(spacing: 14) {
+                if let gain = model.elevationGainText {
+                    Label(gain, systemImage: "arrow.up.right")
+                }
+                if let eta = model.estimatedDurationText {
+                    Label("\(eta) est.", systemImage: "clock")
+                }
+                Spacer()
+            }
+            .font(.subheadline)
             .legibleGlow()
 
             HStack(spacing: 10) {
@@ -226,6 +392,29 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(Color.gray.opacity(0.7))
                 .fixedSize()
+            }
+
+            HStack(spacing: 10) {
+                Menu {
+                    Button { model.computeAlternative(mode: .shorter) } label: {
+                        Label("Shorter route", systemImage: "arrow.down.right.and.arrow.up.left")
+                    }
+                    Button { model.computeAlternative(mode: .longer) } label: {
+                        Label("Longer / scenic route", systemImage: "arrow.up.left.and.arrow.down.right")
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        if model.altState == .working { ProgressView().controlSize(.small) }
+                        Label(model.altState == .working ? "Finding route…" : "Routes",
+                              systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                            .lineLimit(1)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.gray.opacity(0.7))
+                .disabled(model.altState == .working)
+                .fixedSize()
+                Spacer()
             }
 
             elevationStatus.legibleGlow()
@@ -260,7 +449,14 @@ struct ContentView: View {
                     hike.start(points: model.travelPoints,
                                name: model.routeName,
                                startCoordinate: start,
-                               intersections: model.intersections)
+                               intersections: model.intersections,
+                               reversed: model.reversed)
+                    if !simulate {
+                        location.onLocation = { coord, elev, time in
+                            hike.ingest(coordinate: coord, elevation: elev, time: time)
+                        }
+                        location.start()   // real GPS + background updates
+                    }
                 } label: {
                     Label("Start", systemImage: "play.fill").bold().frame(maxWidth: .infinity)
                 }
@@ -301,6 +497,7 @@ struct ContentView: View {
                      tint: hike.isOffTrail ? .red : .secondary)
             }
             HStack(spacing: 0) {
+                stat("Time left", hike.timeLeftText)
                 stat("ETA (calc)", hike.etaCalcText)
                 stat("ETA (pace)", hike.etaPaceText)
                 stat("Pace vs calc", hike.paceDeltaText, tint: paceColor)

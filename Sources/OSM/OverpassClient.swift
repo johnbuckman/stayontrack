@@ -25,7 +25,12 @@ enum OverpassClient {
     private static let perEndpointTimeout: TimeInterval = 20
 
     static func fetchIntersections(bbox: (s: Double, w: Double, n: Double, e: Double)) async throws -> [Intersection] {
-        let filter = "path|footway|track|steps|bridleway|cycleway|pedestrian|unclassified|service"
+        // Trails AND ordinary streets: when a route leaves the trail network to
+        // cross a town or follow a road, we still want turn cues at the street
+        // corners it passes, not only at trail junctions.
+        let filter = "path|footway|track|steps|bridleway|cycleway|pedestrian|"
+            + "unclassified|service|residential|living_street|road|"
+            + "tertiary|tertiary_link|secondary|secondary_link|primary|primary_link"
         let query = """
         [out:json][timeout:25];
         way["highway"~"^(\(filter))$"](\(bbox.s),\(bbox.w),\(bbox.n),\(bbox.e));
@@ -56,6 +61,50 @@ enum OverpassClient {
             if round < maxRounds - 1 {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)   // 2 s before retrying
             }
+        }
+        throw FetchError.allEndpointsFailed
+    }
+
+    /// Fetches the raw walkable graph (node coordinates + ways as node-id lists)
+    /// in a bbox, for offline route-finding (alternative / avoid-steep routes).
+    static func fetchGraph(bbox: (s: Double, w: Double, n: Double, e: Double)) async throws
+        -> (nodes: [Int: CLLocationCoordinate2D], ways: [[Int]]) {
+        let filter = "path|footway|track|steps|bridleway|cycleway|pedestrian|"
+            + "unclassified|service|residential|living_street|road|"
+            + "tertiary|tertiary_link|secondary|secondary_link|primary|primary_link"
+        let query = """
+        [out:json][timeout:25];
+        way["highway"~"^(\(filter))$"](\(bbox.s),\(bbox.w),\(bbox.n),\(bbox.e));
+        (._;>;);
+        out;
+        """
+        let body = "data=\(query)".data(using: .utf8)!
+        for round in 0..<3 {
+            for endpoint in endpoints {
+                guard let url = URL(string: endpoint) else { continue }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue(osmUserAgent, forHTTPHeaderField: "User-Agent")
+                request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+                request.timeoutInterval = perEndpointTimeout
+                do {
+                    let (data, response) = try await URLSession.shared.upload(for: request, from: body)
+                    guard (response as? HTTPURLResponse)?.statusCode == 200 else { continue }
+                    if let payload = try? JSONDecoder().decode(Payload.self, from: data) {
+                        var nodes: [Int: CLLocationCoordinate2D] = [:]
+                        var ways: [[Int]] = []
+                        for e in payload.elements {
+                            if e.type == "node", let lat = e.lat, let lon = e.lon {
+                                nodes[e.id] = CLLocationCoordinate2D(latitude: lat, longitude: lon)
+                            } else if e.type == "way", let ns = e.nodes, ns.count > 1 {
+                                ways.append(ns)
+                            }
+                        }
+                        if !nodes.isEmpty { return (nodes, ways) }
+                    }
+                } catch { continue }
+            }
+            if round < 2 { try? await Task.sleep(nanoseconds: 2_000_000_000) }
         }
         throw FetchError.allEndpointsFailed
     }

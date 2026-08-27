@@ -13,7 +13,12 @@ final class VoiceAnnouncer {
     private let clips: [String: String] = [
         "Left": "v_left",
         "Right": "v_right",
-        "Straight": "v_straight"
+        "Straight": "v_straight",
+        "20 meters off trail": "v_off20",
+        "50 meters off trail": "v_off50",
+        "100 meters off trail": "v_off100",
+        "Wrong turn": "v_wrongturn",
+        "Back on trail": "v_backontrail"
     ]
 
     func speak(_ text: String) {

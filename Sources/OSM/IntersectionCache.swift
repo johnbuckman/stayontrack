@@ -14,9 +14,14 @@ enum IntersectionCache {
             .appendingPathComponent("JunctionCache", isDirectory: true)
     }
 
+    /// Bumped whenever the Overpass query changes so stale caches (e.g. the old
+    /// trail-only network, before streets were added) are ignored.
+    private static let schema = "v2-streets"
+
     /// Stable key from the route geometry (independent of direction).
     static func key(for coords: [CLLocationCoordinate2D]) -> String {
         var hasher = SHA256()
+        hasher.update(data: Data(schema.utf8))
         for c in coords {
             hasher.update(data: Data(String(format: "%.6f,%.6f;", c.latitude, c.longitude).utf8))
         }
