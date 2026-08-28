@@ -34,6 +34,7 @@ struct RouteMapView: UIViewRepresentable {
         map.pointOfInterestFilter = .excludingAll
         map.isRotateEnabled = true    // two-finger rotate; arrows are heading-compensated below
         map.isPitchEnabled = false
+        map.showsCompass = true       // built-in compass appears when rotated; tap it to reset north
         let overlay = OSMTileOverlay()
         map.addOverlay(overlay, level: .aboveLabels)
 
@@ -41,12 +42,6 @@ struct RouteMapView: UIViewRepresentable {
                                          action: #selector(Coordinator.handlePan(_:)))
         pan.delegate = context.coordinator
         map.addGestureRecognizer(pan)
-
-        // Three-finger tap resets the map to true north.
-        let resetNorth = UITapGestureRecognizer(target: context.coordinator,
-                                                action: #selector(Coordinator.resetToNorth(_:)))
-        resetNorth.numberOfTouchesRequired = 3
-        map.addGestureRecognizer(resetNorth)
 
         context.coordinator.map = map
         return map
@@ -259,14 +254,6 @@ struct RouteMapView: UIViewRepresentable {
                 // User is panning the map to look around → stop following.
                 onUserPan?()
             }
-        }
-
-        /// Three-finger tap → snap the map back to true north.
-        @objc func resetToNorth(_ gesture: UITapGestureRecognizer) {
-            guard let map = gesture.view as? MKMapView else { return }
-            let camera = map.camera.copy() as! MKMapCamera
-            camera.heading = 0
-            map.setCamera(camera, animated: true)
         }
 
         /// Junction arrows are baked pointing at their absolute compass bearing
