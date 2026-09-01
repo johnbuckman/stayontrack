@@ -23,6 +23,9 @@ final class RouteModel: ObservableObject {
     /// Eateries within ~200 m of the trail, in the route's CANONICAL direction.
     @Published var restaurants: [TrailRestaurant] = []
     private var restaurantTask: Task<Void, Never>?
+
+    @Published var toilets: [TrailToilet] = []
+    private var toiletTask: Task<Void, Never>?
     /// Hourly temperature forecast covering the hike window.
     @Published var weather: [WeatherHour] = []
     private var weatherTask: Task<Void, Never>?
@@ -114,6 +117,7 @@ final class RouteModel: ObservableObject {
         startTileDownload(for: parsed)
         startTrailFetch(for: parsed)
         startRestaurantFetch(for: parsed)
+        startToiletFetch(for: parsed)
         startWeatherFetch(for: parsed)
         startElevationFillIfNeeded(for: parsed)
     }
@@ -221,6 +225,36 @@ final class RouteModel: ObservableObject {
         }
         return restaurants.map { r in
             var m = r; m.routeDistance = max(0, total - r.routeDistance); return m
+        }.sorted { $0.routeDistance < $1.routeDistance }
+    }
+
+    private func startToiletFetch(for route: GPXRoute) {
+        toiletTask?.cancel()
+        toilets = []
+        let coords = route.coordinates
+        guard coords.count > 1 else { return }
+        let cum = Geo.cumulativeDistances(coords)
+        let cacheKey = ToiletCache.key(for: coords)
+        if let cached = ToiletCache.load(cacheKey) {
+            toilets = cached
+            return
+        }
+        toiletTask = Task { [weak self] in
+            let found = await ToiletFinder.fetch(coords: coords, cumulative: cum)
+            guard let self, !Task.isCancelled else { return }
+            ToiletCache.save(cacheKey, found)
+            self.toilets = found
+        }
+    }
+
+    /// Toilets with `routeDistance` expressed in the CURRENT travel direction
+    /// (flips when Reverse is on), sorted by how soon you reach them.
+    var travelToilets: [TrailToilet] {
+        guard reversed, let total = route?.totalDistance else {
+            return toilets
+        }
+        return toilets.map { t in
+            var m = t; m.routeDistance = max(0, total - t.routeDistance); return m
         }.sorted { $0.routeDistance < $1.routeDistance }
     }
 

@@ -1,9 +1,10 @@
 import SwiftUI
 
-/// Trailside eateries within ~200 m of the route, ordered by how soon you reach
+/// Public toilets within ~150 m of the route, ordered by how soon you reach
 /// them. While hiking, each row shows the estimated clock time you'll pass it.
-struct RestaurantListView: View {
-    let restaurants: [TrailRestaurant]
+/// Mirrors `RestaurantListView`.
+struct ToiletListView: View {
+    let toilets: [TrailToilet]
     /// Given a distance-along-route (m), the grade-adjusted time INTO the hike
     /// (h:mm from the start) at which you reach it. Nil if unknown.
     let etaIntoHike: (Double) -> String?
@@ -13,40 +14,39 @@ struct RestaurantListView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if restaurants.isEmpty {
-                    ContentUnavailableView("No eateries nearby",
-                                           systemImage: "fork.knife",
-                                           description: Text("Nothing within 200 m of this trail."))
+                if toilets.isEmpty {
+                    ContentUnavailableView("No toilets nearby",
+                                           systemImage: "toilet",
+                                           description: Text("Nothing within 150 m of this trail."))
                 } else {
-                    List(restaurants) { r in
+                    List(toilets) { t in
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(r.name).font(.body.weight(.medium))
-                                Text("\(r.alongText) along · \(Int(r.offset)) m off trail")
+                                Text(t.name).font(.body.weight(.medium))
+                                Text("\(t.alongText) along · \(Int(t.offset)) m off trail")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            if let eta = etaIntoHike(r.routeDistance) {
+                            if let eta = etaIntoHike(t.routeDistance) {
                                 VStack(alignment: .trailing, spacing: 2) {
                                     Text(eta).font(.body.monospacedDigit().weight(.semibold))
                                     Text("into hike").font(.caption2).foregroundStyle(.secondary)
                                 }
                             }
-                            // Open this eatery's exact GPS coordinates in Google Maps.
                             Button {
-                                openURL(googleMapsURL(lat: r.lat, lon: r.lon))
+                                openURL(googleMapsURL(lat: t.lat, lon: t.lon))
                             } label: {
                                 Image(systemName: "map.fill")
                                     .font(.title3)
                                     .foregroundStyle(.blue)
                             }
                             .buttonStyle(.borderless)
-                            .accessibilityLabel("Open \(r.name) in Google Maps")
+                            .accessibilityLabel("Open toilet in Google Maps")
                         }
                     }
                 }
             }
-            .navigationTitle("Nearby food")
+            .navigationTitle("Nearby toilets")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
@@ -54,10 +54,4 @@ struct RestaurantListView: View {
             }
         }
     }
-}
-
-/// A Google Maps search URL pinned at exact GPS coordinates. Opens the Google
-/// Maps app if installed, otherwise Google Maps in the browser.
-func googleMapsURL(lat: Double, lon: Double) -> URL {
-    URL(string: "https://www.google.com/maps/search/?api=1&query=\(lat),\(lon)")!
 }

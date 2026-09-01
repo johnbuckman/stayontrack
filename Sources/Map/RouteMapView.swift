@@ -10,6 +10,7 @@ struct RouteMapView: UIViewRepresentable {
     let markers: [DistanceMarker]
     var junctions: [Junction] = []
     var restaurants: [TrailRestaurant] = []
+    var toilets: [TrailToilet] = []
     var walker: CLLocationCoordinate2D?
     var breadcrumb: [CLLocationCoordinate2D] = []
     var simulating: Bool = false
@@ -61,6 +62,7 @@ struct RouteMapView: UIViewRepresentable {
                                  markers: markers,
                                  junctions: junctions,
                                  restaurants: restaurants,
+                                 toilets: toilets,
                                  walker: walker,
                                  breadcrumb: breadcrumb)
     }
@@ -89,12 +91,14 @@ struct RouteMapView: UIViewRepresentable {
         private var lastJunctionSig = ""
 
         private var lastRestaurantSig = ""
+        private var lastToiletSig = ""
 
         func sync(_ map: MKMapView,
                   coordinates: [CLLocationCoordinate2D],
                   markers: [DistanceMarker],
                   junctions: [Junction],
                   restaurants: [TrailRestaurant],
+                  toilets: [TrailToilet],
                   walker: CLLocationCoordinate2D?,
                   breadcrumb: [CLLocationCoordinate2D]) {
 
@@ -146,6 +150,14 @@ struct RouteMapView: UIViewRepresentable {
                 map.removeAnnotations(map.annotations.compactMap { $0 as? RestaurantAnnotation })
                 map.addAnnotations(restaurants.map(RestaurantAnnotation.init))
                 lastRestaurantSig = restaurantSig
+            }
+
+            // Public-toilet pins near the trail — rebuild only on change.
+            let toiletSig = toilets.map { String($0.id) }.joined(separator: ",")
+            if toiletSig != lastToiletSig {
+                map.removeAnnotations(map.annotations.compactMap { $0 as? ToiletAnnotation })
+                map.addAnnotations(toilets.map(ToiletAnnotation.init))
+                lastToiletSig = toiletSig
             }
 
             // Faint breadcrumb of the actual walk.
@@ -385,6 +397,16 @@ struct RouteMapView: UIViewRepresentable {
                 view.canShowCallout = true
                 return view
             }
+            if annotation is ToiletAnnotation {
+                let id = "toilet"
+                let view = map.dequeueReusableAnnotationView(withIdentifier: id)
+                    ?? MKAnnotationView(annotation: annotation, reuseIdentifier: id)
+                view.annotation = annotation
+                view.image = ToiletIcon.image
+                view.centerOffset = CGPoint(x: 0, y: -11)
+                view.canShowCallout = true
+                return view
+            }
             if let junction = annotation as? JunctionAnnotation {
                 let id = "junction-arrow"
                 let view = map.dequeueReusableAnnotationView(withIdentifier: id)
@@ -442,6 +464,29 @@ enum RestaurantIcon {
             UIColor.systemOrange.setFill(); c.fillEllipse(in: disc)
             UIColor.white.setStroke(); c.setLineWidth(1.5); c.strokeEllipse(in: disc)
             let glyph = UIImage(systemName: "fork.knife")?
+                .withTintColor(.white, renderingMode: .alwaysOriginal)
+            glyph?.draw(in: CGRect(x: 6, y: 6, width: 14, height: 14))
+        }
+    }()
+}
+
+final class ToiletAnnotation: NSObject, MKAnnotation {
+    let coordinate: CLLocationCoordinate2D
+    let name: String
+    init(_ t: TrailToilet) { coordinate = t.coordinate; name = t.name }
+    var title: String? { name }
+}
+
+/// A small teal pin with a toilet glyph for a trailside public toilet.
+enum ToiletIcon {
+    static let image: UIImage = {
+        let size = CGSize(width: 26, height: 26)
+        return UIGraphicsImageRenderer(size: size).image { ctx in
+            let c = ctx.cgContext
+            let disc = CGRect(x: 1, y: 1, width: 24, height: 24)
+            UIColor.systemTeal.setFill(); c.fillEllipse(in: disc)
+            UIColor.white.setStroke(); c.setLineWidth(1.5); c.strokeEllipse(in: disc)
+            let glyph = UIImage(systemName: "toilet")?
                 .withTintColor(.white, renderingMode: .alwaysOriginal)
             glyph?.draw(in: CGRect(x: 6, y: 6, width: 14, height: 14))
         }

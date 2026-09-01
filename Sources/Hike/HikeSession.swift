@@ -55,6 +55,7 @@ final class HikeSession: ObservableObject {
 
     // "Wrong turn" / repeat-instruction bookkeeping.
     private var wrongTurnSaid = Set<Int>()           // junctions we've warned a wrong turn past
+    private var wrongTurnActive = false              // said "wrong turn" this stray; wait until back on trail
     private var repeatAnchor: CLLocationCoordinate2D?
     private var repeatAnchorSince: Date?
     private var repeatJunctionIndex: Int?
@@ -114,7 +115,7 @@ final class HikeSession: ObservableObject {
         eta = ETAEngine(travelPoints: points)
         announcedApproach = []; announcedAt = []
         offTrailBandAnnounced = 0; fastSince = nil; lastFixTime = nil; strayOutstanding = false
-        wrongTurnSaid = []; repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
+        wrongTurnSaid = []; wrongTurnActive = false; repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
 
         recorded = []; breadcrumb = []
         distanceWalked = 0; elevationGain = 0; offTrackMeters = 0; elapsed = 0
@@ -165,7 +166,7 @@ final class HikeSession: ObservableObject {
         elapsed = Date().timeIntervalSince(cp.startDate)
 
         offTrailBandAnnounced = 0; fastSince = nil; lastFixTime = nil; strayOutstanding = false
-        wrongTurnSaid = []; repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
+        wrongTurnSaid = []; wrongTurnActive = false; repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
 
         // Don't re-announce junctions we've already walked past.
         announcedApproach = []; announcedAt = []
@@ -201,6 +202,25 @@ final class HikeSession: ObservableObject {
         phase = .idle
         walker = nil; breadcrumb = []; recorded = []
         HikeCheckpointStore.clear()
+    }
+
+    /// Swap in a freshly-computed junction set for the hike already in progress.
+    /// Needed when a new GPX is loaded mid-trail: the route's OSM junctions come
+    /// from Overpass asynchronously, so `start` may have begun with none. We keep
+    /// junctions already behind us marked as "announced" (so we don't suddenly
+    /// call out turns we've walked past) and leave upcoming ones pending so they
+    /// speak normally. Ignored unless a hike is active and the set really changed.
+    func updateJunctions(_ newJunctions: [Junction]) {
+        guard phase == .active else { return }
+        guard newJunctions.map(\.routeDistance) != junctions.map(\.routeDistance) else { return }
+        junctions = newJunctions
+        announcedApproach = []; announcedAt = []; wrongTurnSaid = []
+        repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
+        for (i, j) in junctions.enumerated() where j.routeDistance < walkerRouteDistance - 10 {
+            announcedAt.insert(i)       // already passed → don't announce retroactively
+            wrongTurnSaid.insert(i)
+        }
+        updateHUD()
     }
 
     /// Persist a crash-recovery snapshot. Cheap enough to call often, but
@@ -272,11 +292,13 @@ final class HikeSession: ObservableObject {
 
     private func announceJunctionsIfNeeded() {
         guard offTrackMeters < 60 else { return }   // don't call turns while well off-route
-        // One cue only, spoken once we're within 7 m of the junction (down from
-        // the old two-stage 50 m + 12 m announcements).
+        // One cue only, spoken ~20 m BEFORE the junction so there's time to react
+        // (up from the old at-the-junction 7 m cue). `announcedAt` keeps it to a
+        // single utterance per junction; the small negative tolerance covers a
+        // GPS fix that first lands just past the trigger point.
         for (index, j) in junctions.enumerated() {
-            if !announcedAt.contains(index),
-               abs(walkerRouteDistance - j.routeDistance) <= 7 {
+            let ahead = j.routeDistance - walkerRouteDistance   // + = junction still in front
+            if !announcedAt.contains(index), ahead <= 20, ahead > -10 {
                 announcedAt.insert(index)
                 lastAnnouncement = j.spoken
                 voice.speak(j.spoken)
@@ -291,6 +313,7 @@ final class HikeSession: ObservableObject {
         // Back within 5 m after having strayed → confirm you're back on trail.
         if offTrackMeters < 5 {
             offTrailBandAnnounced = 0
+            wrongTurnActive = false        // back on trail → a fresh stray may warn again
             if strayOutstanding {
                 strayOutstanding = false
                 lastAnnouncement = "Back on trail"
@@ -315,18 +338,28 @@ final class HikeSession: ObservableObject {
     }
 
     /// After walking past a junction, if we've drifted more than 20 m off the
-    /// trail, say "wrong turn" once for that junction.
+    /// trail, say "wrong turn" — but only ONCE per stray episode. When off-trail
+    /// the projected `walkerRouteDistance` drifts and can fall inside a later
+    /// junction's window, which used to fire a second, spurious "wrong turn"
+    /// well past the actual mistake. So we gate on `wrongTurnActive` (cleared
+    /// only when we're back on the trail, in `updateOffTrailSpeech`) and warn
+    /// for the single nearest junction just behind us, not every junction whose
+    /// window the drift happens to touch.
     private func checkWrongTurn() {
-        guard offTrackMeters > 20 else { return }
-        for (index, j) in junctions.enumerated()
-        where walkerRouteDistance >= j.routeDistance
-                && walkerRouteDistance <= j.routeDistance + 60
-                && !wrongTurnSaid.contains(index) {
-            wrongTurnSaid.insert(index)
-            strayOutstanding = true
-            lastAnnouncement = "Wrong turn"
-            voice.speak("Wrong turn")
-        }
+        guard offTrackMeters > 20, !wrongTurnActive else { return }
+        // The junction we most recently passed (largest routeDistance at or
+        // behind us, within 60 m) — the one we plausibly took the wrong fork at.
+        guard let (index, _) = junctions.enumerated()
+            .filter({ walkerRouteDistance >= $0.element.routeDistance
+                        && walkerRouteDistance <= $0.element.routeDistance + 60
+                        && !wrongTurnSaid.contains($0.offset) })
+            .max(by: { $0.element.routeDistance < $1.element.routeDistance })
+        else { return }
+        wrongTurnSaid.insert(index)
+        wrongTurnActive = true
+        strayOutstanding = true
+        lastAnnouncement = "Wrong turn"
+        voice.speak("Wrong turn")
     }
 
     /// If you stall at a junction (haven't moved 5 m for 10 s while one is right

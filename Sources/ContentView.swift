@@ -18,10 +18,18 @@ struct ContentView: View {
         #endif
     }()
     @State private var following = true         // auto-recenter on the walker
+
+    /// The junction HUD banner occupies the top-centre while hiking; the
+    /// top-corner buttons (recenter/food, stop, calculating badge) drop below it
+    /// by this much so nothing overlaps the banner.
+    private var hudBannerVisible: Bool { hike.isActive && hike.hudJunction != nil }
+    private let hudBannerDrop: CGFloat = 112
+
     @State private var showStopConfirm = false
     @State private var showLocationDenied = false
     @State private var showWalkList = false
     @State private var showFood = false
+    @State private var showToilets = false
     @State private var pendingResume: HikeCheckpoint?     // crash-recovery offer
     @State private var checkedForResume = false
 
@@ -51,6 +59,13 @@ struct ContentView: View {
             Text(model.errorMessage ?? "")
         }
         .task { offerResumeIfInterrupted() }
+        .onOpenURL { handleOpenedGPX($0) }
+        // When the OSM junctions for the current route finish loading (Overpass
+        // is async), push them into an in-progress hike — the case that matters
+        // is a new GPX opened mid-trail, whose turns aren't ready at start.
+        .onChange(of: model.intersections.count) { _, _ in
+            if hike.isActive { hike.updateJunctions(model.junctions) }
+        }
         .alert("Resume hike?", isPresented: Binding(get: { pendingResume != nil },
                                                     set: { if !$0 { pendingResume = nil } })) {
             Button("Resume") { resumeInterruptedHike() }
@@ -71,6 +86,49 @@ struct ContentView: View {
         checkedForResume = true
         guard hike.phase == .idle, let cp = HikeCheckpointStore.load() else { return }
         pendingResume = cp
+    }
+
+    /// Start guiding the currently-loaded route (the Start button, and also the
+    /// auto-start when a new GPX arrives mid-hike). Wires live GPS unless we're
+    /// in drag-to-walk simulation.
+    private func beginFollowing() {
+        guard let start = model.travelCoordinates.first else { return }
+        following = true
+        hike.start(points: model.travelPoints,
+                   name: model.routeName,
+                   startCoordinate: start,
+                   intersections: model.intersections,
+                   reversed: model.reversed)
+        if !simulate {
+            location.onLocation = { coord, elev, time in
+                hike.ingest(coordinate: coord, elevation: elev, time: time)
+            }
+            location.start()   // real GPS + background updates
+        }
+    }
+
+    /// A GPX opened (share sheet / Files / open-in). If a hike is already
+    /// running, drop it and start following the new route instead of continuing
+    /// to guide the old trail.
+    private func handleOpenedGPX(_ url: URL) {
+        let wasHiking = hike.isActive
+        if wasHiking {
+            hike.reset()
+            location.stop()
+        }
+        model.load(from: url)
+        // Auto-start on the new route so guidance continues seamlessly. Junctions
+        // are the geometry set until Overpass finishes filling model.intersections
+        // in the background (same tradeoff as any freshly-imported route).
+        if wasHiking { beginFollowing() }
+    }
+
+    /// Load a saved walk's GPX as the current route, returning to the pre-start
+    /// screen ready to hike it again.
+    private func loadSavedWalk(_ url: URL) {
+        hike.reset()
+        location.stop()
+        model.load(from: url)
     }
 
     private func resumeInterruptedHike() {
@@ -119,6 +177,7 @@ struct ContentView: View {
                      markers: model.markers,
                      junctions: model.junctions,
                      restaurants: model.restaurants,
+                     toilets: model.toilets,
                      walker: hike.walker,
                      breadcrumb: hike.breadcrumb,
                      simulating: simulate && hike.isActive,
@@ -143,7 +202,7 @@ struct ContentView: View {
                 Button("Keep hiking", role: .cancel) {}
             }
             .sheet(isPresented: $showWalkList) {
-                WalkListView(store: hike.walkStore)
+                WalkListView(store: hike.walkStore, onLoad: loadSavedWalk)
             }
             .sheet(isPresented: $showFood) {
                 RestaurantListView(restaurants: model.travelRestaurants,
@@ -153,6 +212,15 @@ struct ContentView: View {
                                        let t = Int(s.rounded())
                                        return String(format: "%d:%02d", t / 3600, (t % 3600) / 60)
                                    })
+            }
+            .sheet(isPresented: $showToilets) {
+                ToiletListView(toilets: model.travelToilets,
+                               etaIntoHike: { d in
+                                   let s = model.predictedSeconds(toDistance: d)
+                                   guard s > 0 else { return nil }
+                                   let t = Int(s.rounded())
+                                   return String(format: "%d:%02d", t / 3600, (t % 3600) / 60)
+                               })
             }
             .onChange(of: location.denied) { _, denied in
                 if denied { showLocationDenied = true }
@@ -184,6 +252,7 @@ struct ContentView: View {
             .background(.ultraThinMaterial, in: Capsule())
             .shadow(radius: 2)
             .padding(8)
+            .padding(.top, hudBannerVisible ? hudBannerDrop : 0)   // drop below the HUD banner
         }
     }
 
@@ -222,7 +291,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .padding(.trailing, 8)
-            .padding(.top, 2)
+            .padding(.top, hudBannerVisible ? hudBannerDrop : 2)   // drop below the HUD banner
         }
     }
 
@@ -236,13 +305,16 @@ struct ContentView: View {
                     .rotationEffect(.degrees(j.angle))   // relative maneuver arrow
                 VStack(alignment: .leading, spacing: 2) {
                     Text(j.instruction).font(.title.bold())
+                        .lineLimit(1).minimumScaleFactor(0.7)   // never wrap "Straight"/"Right"
                     Text("\(Int(hike.hudMeters)) m")
                         .font(.title2).monospacedDigit().opacity(0.9)
                 }
                 Spacer()
             }
             .padding(20)
-            .containerRelativeFrame(.horizontal) { width, _ in width * 0.5 }
+            // Reverted to the previous full-width banner (the width*0.5 shrink
+            // made short instructions wrap); corner buttons drop below it now.
+            .padding(.horizontal, 12)
             .background(.blue.opacity(0.7), in: RoundedRectangle(cornerRadius: 18))
             .foregroundStyle(.white)
             .shadow(radius: 5)
@@ -280,8 +352,19 @@ struct ContentView: View {
                         .shadow(radius: 3)
                 }
             }
+            if !model.toilets.isEmpty {
+                Button { showToilets = true } label: {
+                    Label("\(model.toilets.count)", systemImage: "toilet")
+                        .font(.subheadline.weight(.semibold))
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(.teal, in: Capsule())
+                        .foregroundStyle(.white)
+                        .shadow(radius: 3)
+                }
+            }
         }
         .padding()
+        .padding(.top, hudBannerVisible ? hudBannerDrop : 0)   // drop below the HUD banner
     }
 
     /// The bottom controls, floated over the map (no opaque panel). A soft
@@ -414,6 +497,13 @@ struct ContentView: View {
                 .tint(Color.gray.opacity(0.7))
                 .disabled(model.altState == .working)
                 .fixedSize()
+
+                Button { showWalkList = true } label: {
+                    Label("Previously", systemImage: "clock.arrow.circlepath").lineLimit(1)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.gray.opacity(0.7))
+                .fixedSize()
                 Spacer()
             }
 
@@ -444,19 +534,7 @@ struct ContentView: View {
                 }
 
                 Button {
-                    guard let start = model.travelCoordinates.first else { return }
-                    following = true
-                    hike.start(points: model.travelPoints,
-                               name: model.routeName,
-                               startCoordinate: start,
-                               intersections: model.intersections,
-                               reversed: model.reversed)
-                    if !simulate {
-                        location.onLocation = { coord, elev, time in
-                            hike.ingest(coordinate: coord, elevation: elev, time: time)
-                        }
-                        location.start()   // real GPS + background updates
-                    }
+                    beginFollowing()
                 } label: {
                     Label("Start", systemImage: "play.fill").bold().frame(maxWidth: .infinity)
                 }

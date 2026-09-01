@@ -19,8 +19,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: Stay on Track
-        CFBundleShortVersionString: "1.1.1"
-        CFBundleVersion: "15"
+        CFBundleShortVersionString: "1.1.4"
+        CFBundleVersion: "18"
         UILaunchScreen: {}
         NSSupportsLiveActivities: true
         UIBackgroundModes:

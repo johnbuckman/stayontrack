@@ -17,10 +17,9 @@ struct StayOnTrackApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(model)
-                // GPX shared to the app / opened from Files.
-                .onOpenURL { url in
-                    model.load(from: url)
-                }
+                // GPX open (share sheet / Files / open-in) is handled inside
+                // ContentView so it can also reset an in-progress hike and start
+                // following the new route.
         }
     }
 

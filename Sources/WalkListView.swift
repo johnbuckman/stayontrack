@@ -4,6 +4,9 @@ import SwiftUI
 /// delete. Shown when the user taps "Export GPX" on the finished screen.
 struct WalkListView: View {
     @ObservedObject var store: WalkStore
+    /// Load a saved walk's GPX as the current route (re-hike it). Optional so
+    /// the view still works where loading isn't offered.
+    var onLoad: ((URL) -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -28,6 +31,15 @@ struct WalkListView: View {
                                     .contentShape(Rectangle())
                                 }
                                 .tint(.primary)
+                                // Load this saved walk as the current route (re-hike it).
+                                if let onLoad {
+                                    Button { onLoad(walk.fileURL); dismiss() } label: {
+                                        Image(systemName: "arrow.down.circle")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .tint(.blue)
+                                    .accessibilityLabel("Load \(walk.name)")
+                                }
                                 // Always-visible delete button (reliable on Mac Catalyst).
                                 Button(role: .destructive) { store.delete(walk) } label: {
                                     Image(systemName: "trash")

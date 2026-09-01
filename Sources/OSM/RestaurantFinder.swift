@@ -80,9 +80,11 @@ enum RestaurantFinder {
 /// shape as `OverpassClient`, for point-of-interest queries.
 enum OverpassPOI {
     struct Element: Decodable {
+        struct Center: Decodable { let lat: Double; let lon: Double }
         let id: Int
         let lat: Double?
         let lon: Double?
+        let center: Center?     // present for way/relation results from `out center`
         let tags: [String: String]?
     }
     private struct Payload: Decodable { let elements: [Element] }
