@@ -144,6 +144,7 @@ final class HikeSession: ObservableObject {
         reversed = cp.reversed
         fixesSinceCheckpoint = 0
         tracker = PolylineTracker(points: points)
+        tracker?.seed(routeDistance: cp.walkerRouteDistance)   // resume where we left off
         plannedCoords = points.map(\.coordinate)
         plannedCumulative = Geo.cumulativeDistances(plannedCoords)
         elevationProfile = zip(plannedCumulative, points).compactMap { d, p in

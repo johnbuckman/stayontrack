@@ -200,29 +200,45 @@ struct RouteMapView: UIViewRepresentable {
 
             let cum = Geo.cumulativeDistances(coordinates)
             let hiking = progressDistance > 0
+            let haveEle = elevations.count == coordinates.count
 
-            func style(at i: Int) -> (widthBucket: Int, alpha: CGFloat) {
-                let d = max(1, cum[i] - cum[i - 1])
-                var grade = 0.0
-                if elevations.count == coordinates.count,
-                   let a = elevations[i - 1], let b = elevations[i] {
-                    grade = abs(b - a) / d
-                }
-                let g = min(grade, 0.25) / 0.25
+            // Grade is sampled over a ~50 m window (±25 m) rather than between
+            // adjacent GPX points (median ~10 m apart). Per-point elevation
+            // noise over such a short step would otherwise spike the grade and
+            // make the line width lurch from thick to thin; smoothing over a
+            // fixed distance makes the thickness change gradually with the
+            // terrain instead.
+            let halfWindow = 25.0
+            func smoothedGrade(at i: Int) -> Double {
+                guard haveEle else { return 0 }
+                var lo = i
+                while lo > 0 && (cum[i] - cum[lo] < halfWindow || elevations[lo] == nil) { lo -= 1 }
+                var hi = i
+                while hi < coordinates.count - 1 && (cum[hi] - cum[i] < halfWindow || elevations[hi] == nil) { hi += 1 }
+                guard let a = elevations[lo], let b = elevations[hi] else { return 0 }
+                let span = max(1, cum[hi] - cum[lo])
+                return abs(b - a) / span
+            }
+
+            func style(at i: Int) -> (width: CGFloat, alpha: CGFloat) {
+                let g = min(smoothedGrade(at: i), 0.25) / 0.25
                 let width = 4.0 * (1.0 + 3.0 * g)                 // 4 px flat → 16 px (4×) at ≥25 %
+                // Quantize to 0.5 px so consecutive segments still merge, but the
+                // steps are fine enough to read as a gradual taper, not a lurch.
+                let quantized = (width * 2).rounded() / 2
                 let aheadStart = cum[i - 1] - progressDistance
                 let alpha: CGFloat = (hiking && aheadStart > 1000) ? 0.5 : 0.8
-                return (Int(width.rounded()), alpha)
+                return (CGFloat(quantized), alpha)
             }
 
             // Merge consecutive segments sharing a (width, alpha) style.
             var runStart = 0
             var current = style(at: 1)
-            func emitRun(_ from: Int, _ to: Int, _ s: (widthBucket: Int, alpha: CGFloat)) {
+            func emitRun(_ from: Int, _ to: Int, _ s: (width: CGFloat, alpha: CGFloat)) {
                 let slice = Array(coordinates[from...to])
                 guard slice.count > 1 else { return }
                 let poly = MKPolyline(coordinates: slice, count: slice.count)
-                segmentStyle[ObjectIdentifier(poly)] = (CGFloat(s.widthBucket), s.alpha)
+                segmentStyle[ObjectIdentifier(poly)] = (s.width, s.alpha)
                 routeSegments.append(poly)
                 map.addOverlay(poly, level: .aboveLabels)
             }
