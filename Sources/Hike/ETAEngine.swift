@@ -12,9 +12,16 @@ struct ETAEngine {
     private let cumulativeTime: [TimeInterval]     // predicted seconds to reach each point
     private let segTime: [TimeInterval]
 
-    init(travelPoints: [GPXPoint]) {
+    /// `distanceScale` stretches every segment's horizontal length (default 1 =
+    /// unchanged). Used for the pre-start estimate, where the OSM-snapped route is
+    /// longer than the raw GPX sum: the recovered length is extra winding at
+    /// roughly the same grades, so scaling distance grows the predicted time too
+    /// while softening slopes only slightly. Live tracking keeps scale 1 so its
+    /// lookups stay in real GPX metres.
+    init(travelPoints: [GPXPoint], distanceScale: Double = 1) {
         let coords = travelPoints.map(\.coordinate)
         var cumDist = Geo.cumulativeDistances(coords)
+        if distanceScale != 1 { cumDist = cumDist.map { $0 * distanceScale } }
         // Smooth the elevation profile first — raw (esp. DEM-sampled) elevation
         // is noisy, and Tobler's exponential slope penalty turns that noise into
         // absurd time estimates. Slope is then clamped to a sane range.

@@ -18,6 +18,9 @@ final class RouteModel: ObservableObject {
         case idle, loading, ready(Int), failed
     }
     @Published var trailState: TrailNetworkState = .idle
+    /// OSM-snapped true trail length (metres). Nil until the trail fetch computes
+    /// it (or from cache); until then the raw GPX sum is shown. See `RouteSnapper`.
+    @Published var correctedDistance: Double?
     @Published var intersections: [Intersection] = []
     @Published var junctions: [Junction] = []
     /// Eateries within ~200 m of the trail, in the route's CANONICAL direction.
@@ -151,15 +154,22 @@ final class RouteModel: ObservableObject {
         trailTimer?.invalidate()
         intersections = []
         junctions = []
+        correctedDistance = nil
         trailElapsed = 0
         let coords = route.coordinates
         guard !coords.isEmpty else { trailState = .idle; return }
 
         // Cached from a previous load of this exact route? Use it instantly —
-        // no network, works offline.
+        // no network, works offline. Distance is cached separately (it may be
+        // missing on routes imported before snapping existed); if so we still
+        // need the network to compute it, so only take the fast path when both
+        // the junctions and the snapped distance are cached.
         let cacheKey = IntersectionCache.key(for: coords)
-        if let cached = IntersectionCache.load(cacheKey) {
+        let distKey = SnappedDistanceCache.key(for: coords)
+        if let cached = IntersectionCache.load(cacheKey),
+           let dist = SnappedDistanceCache.load(distKey) {
             intersections = cached
+            correctedDistance = dist.distance
             recomputeJunctions()
             trailState = .ready(junctions.count)
             return
@@ -182,11 +192,20 @@ final class RouteModel: ObservableObject {
                     n: lats.max()! + pad, e: lons.max()! + pad)
         trailTask = Task { [weak self] in
             do {
-                let found = try await OverpassClient.fetchIntersections(bbox: bbox)
+                // One graph fetch serves both features: junctions are the
+                // degree-≥3 nodes; the snapper measures the route along the same
+                // ways to recover the length the sparse GPX sampling chorded off.
+                let (nodes, ways) = try await OverpassClient.fetchGraph(bbox: bbox)
+                let found = OverpassClient.deriveIntersections(nodes: nodes, ways: ways)
+                let snapped = await Task.detached(priority: .utility) {
+                    RouteSnapper.correctedDistance(coords: coords, nodes: nodes, ways: ways)
+                }.value
                 guard let self, !Task.isCancelled else { return }
                 self.trailTimer?.invalidate(); self.trailTimer = nil
-                IntersectionCache.save(cacheKey, found)   // reuse next time, offline
+                IntersectionCache.save(cacheKey, found)          // reuse next time, offline
+                SnappedDistanceCache.save(distKey, snapped)
                 self.intersections = found
+                self.correctedDistance = snapped.distance
                 self.recomputeJunctions()
                 self.trailState = .ready(self.junctions.count)
             } catch {
@@ -384,9 +403,26 @@ final class RouteModel: ObservableObject {
 
     // MARK: Summary
 
+    /// The distance to *show* for the route: the OSM-snapped true trail length
+    /// once computed, else the raw GPX sum. The raw sum chords across every bend
+    /// of a sparsely-sampled planned route and reads ~10–15% short of what other
+    /// apps report; snapping to the OSM ways recovers the lost curve.
+    var displayedDistance: Double {
+        correctedDistance ?? (route?.totalDistance ?? 0)
+    }
+
+    /// How much longer the snapped route is than the raw GPX sum (1 = no data
+    /// yet). Applied to the pre-start time estimate so it, too, reflects the
+    /// real distance. Live in-hike ETA stays in raw metres.
+    var distanceScale: Double {
+        guard let corrected = correctedDistance,
+              let raw = route?.totalDistance, raw > 0 else { return 1 }
+        return corrected / raw
+    }
+
     var distanceKmText: String {
-        guard let route else { return "—" }
-        return String(format: "%.2f km", route.totalDistance / 1000.0)
+        guard route != nil else { return "—" }
+        return String(format: "%.2f km", displayedDistance / 1000.0)
     }
 
     /// Total elevation gain of the planned route (sum of positive climbs, using
@@ -412,7 +448,8 @@ final class RouteModel: ObservableObject {
     var estimatedDurationText: String? {
         let points = travelPoints
         guard points.count > 1 else { return nil }
-        let seconds = ETAEngine(travelPoints: points).calculatedRemaining(fromDistance: 0)
+        let seconds = ETAEngine(travelPoints: points, distanceScale: distanceScale)
+            .calculatedRemaining(fromDistance: 0)
         guard seconds > 0 else { return nil }
         let total = Int(seconds.rounded())
         return String(format: "%d:%02d", total / 3600, (total % 3600) / 60)

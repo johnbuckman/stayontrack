@@ -124,25 +124,30 @@ enum OverpassClient {
 
     private static func parse(_ data: Data) throws -> [Intersection] {
         let payload = try JSONDecoder().decode(Payload.self, from: data)
-
         var coordByNode: [Int: CLLocationCoordinate2D] = [:]
         for e in payload.elements where e.type == "node" {
             if let lat = e.lat, let lon = e.lon {
                 coordByNode[e.id] = CLLocationCoordinate2D(latitude: lat, longitude: lon)
             }
         }
+        let ways = payload.elements.compactMap { $0.type == "way" ? $0.nodes : nil }
+        return deriveIntersections(nodes: coordByNode, ways: ways)
+    }
 
+    /// Junction nodes (graph degree ≥ 3) from a raw node/way graph — the same
+    /// derivation `parse` uses, exposed so a single `fetchGraph` at import can
+    /// feed both junction detection and route snapping without a second fetch.
+    static func deriveIntersections(nodes: [Int: CLLocationCoordinate2D],
+                                    ways: [[Int]]) -> [Intersection] {
         // Graph degree: interior node +2 (edge in, edge out), endpoint +1.
         var degree: [Int: Int] = [:]
-        for e in payload.elements where e.type == "way" {
-            guard let nodes = e.nodes, nodes.count > 1 else { continue }
-            for (i, node) in nodes.enumerated() {
-                degree[node, default: 0] += (i == 0 || i == nodes.count - 1) ? 1 : 2
+        for way in ways where way.count > 1 {
+            for (i, node) in way.enumerated() {
+                degree[node, default: 0] += (i == 0 || i == way.count - 1) ? 1 : 2
             }
         }
-
         return degree.compactMap { node, deg in
-            guard deg >= 3, let coord = coordByNode[node] else { return nil }
+            guard deg >= 3, let coord = nodes[node] else { return nil }
             return Intersection(coordinate: coord, degree: deg)
         }
     }
