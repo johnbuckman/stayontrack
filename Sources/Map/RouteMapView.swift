@@ -26,6 +26,8 @@ struct RouteMapView: UIViewRepresentable {
     var progressDistance: Double = 0
     /// Device compass heading (true north degrees) → the on-map compass needle.
     var walkerHeading: Double?
+    /// Basemap style: `.standard` OSM or `.topo` (OpenTopoMap contour lines).
+    var mapStyle: MapStyle = .standard
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -36,8 +38,9 @@ struct RouteMapView: UIViewRepresentable {
         map.isRotateEnabled = true    // two-finger rotate; arrows are heading-compensated below
         map.isPitchEnabled = false
         map.showsCompass = true       // built-in compass appears when rotated; tap it to reset north
-        let overlay = OSMTileOverlay()
+        let overlay = MapTileOverlay(style: mapStyle)
         map.addOverlay(overlay, level: .aboveLabels)
+        context.coordinator.tileOverlay = overlay
 
         let pan = UIPanGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handlePan(_:)))
@@ -49,6 +52,7 @@ struct RouteMapView: UIViewRepresentable {
     }
 
     func updateUIView(_ map: MKMapView, context: Context) {
+        context.coordinator.swapTileOverlay(map, to: mapStyle)
         context.coordinator.onWalk = onWalk
         context.coordinator.simulating = simulating
         context.coordinator.autoFollow = autoFollow
@@ -71,7 +75,18 @@ struct RouteMapView: UIViewRepresentable {
 
     final class Coordinator: NSObject, MKMapViewDelegate, UIGestureRecognizerDelegate {
         weak var map: MKMapView?
+        var tileOverlay: MapTileOverlay?
         var onWalk: ((CLLocationCoordinate2D) -> Void)?
+
+        /// Replace the basemap tile overlay when the style changes, keeping it at
+        /// the bottom (aboveLabels) so route/markers/breadcrumb stay on top.
+        func swapTileOverlay(_ map: MKMapView, to style: MapStyle) {
+            guard tileOverlay?.style != style else { return }
+            if let old = tileOverlay { map.removeOverlay(old) }
+            let overlay = MapTileOverlay(style: style)
+            map.insertOverlay(overlay, at: 0, level: .aboveLabels)
+            tileOverlay = overlay
+        }
         var simulating = false
         var autoFollow = false
         var following = true

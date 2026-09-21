@@ -18,6 +18,18 @@ final class RouteModel: ObservableObject {
         case idle, loading, ready(Int), failed
     }
     @Published var trailState: TrailNetworkState = .idle
+    /// Basemap style, remembered across launches. Switching to `.topo` shows
+    /// OpenTopoMap's elevation contour lines and pre-downloads that corridor so
+    /// it works offline like the standard map.
+    @Published var mapStyle: MapStyle = MapStyle(rawValue:
+        UserDefaults.standard.string(forKey: "mapStyle") ?? "") ?? .standard {
+        didSet {
+            guard mapStyle != oldValue else { return }
+            UserDefaults.standard.set(mapStyle.rawValue, forKey: "mapStyle")
+            if mapStyle != .standard, let route { startTileDownload(for: route, style: mapStyle) }
+        }
+    }
+    private var topoDownloadTask: Task<Void, Never>?
     /// OSM-snapped true trail length (metres). Nil until the trail fetch computes
     /// it (or from cache); until then the raw GPX sum is shown. See `RouteSnapper`.
     @Published var correctedDistance: Double?
@@ -118,6 +130,7 @@ final class RouteModel: ObservableObject {
         errorMessage = nil
         rebuildETA()
         startTileDownload(for: parsed)
+        if mapStyle != .standard { startTileDownload(for: parsed, style: mapStyle) }
         startTrailFetch(for: parsed)
         startRestaurantFetch(for: parsed)
         startToiletFetch(for: parsed)
@@ -367,14 +380,14 @@ final class RouteModel: ObservableObject {
     }
 
     /// Pre-caches the OSM tile corridor so the map works offline on the hike.
-    private func startTileDownload(for route: GPXRoute) {
-        downloadTask?.cancel()
+    private func startTileDownload(for route: GPXRoute, style: MapStyle = .standard) {
+        if style == .standard { downloadTask?.cancel() } else { topoDownloadTask?.cancel() }
         tileProgress = TileProgress(done: 0, total: 0)
         tileEtaSeconds = nil
         tileStart = Date()
         let coords = route.coordinates
-        downloadTask = Task { [weak self, downloader] in
-            await downloader.download(coords: coords) { progress in
+        let task = Task { [weak self, downloader] in
+            await downloader.download(coords: coords, style: style) { progress in
                 guard let self else { return }
                 self.tileProgress = progress
                 if let start = self.tileStart, progress.done > 0, !progress.isComplete {
@@ -388,6 +401,7 @@ final class RouteModel: ObservableObject {
                 }
             }
         }
+        if style == .standard { downloadTask = task } else { topoDownloadTask = task }
     }
 
     private func recomputeMarkers() {

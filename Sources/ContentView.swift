@@ -189,7 +189,8 @@ struct ContentView: View {
                      onUserPan: { following = false },
                      elevations: model.travelPoints.map(\.elevation),
                      progressDistance: hike.isActive ? hike.routeProgress : 0,
-                     walkerHeading: hike.isActive && !simulate ? location.heading : nil)
+                     walkerHeading: hike.isActive && !simulate ? location.heading : nil,
+                     mapStyle: model.mapStyle)
             .ignoresSafeArea()
             .overlay(alignment: .top) { junctionHUD }
             .overlay(alignment: .topLeading) { recenterButton }
@@ -330,6 +331,18 @@ struct ContentView: View {
     /// Shown when a real walk is in progress but the user has panned away.
     @ViewBuilder private var recenterButton: some View {
         VStack(alignment: .leading, spacing: 10) {
+            Button {
+                model.mapStyle = model.mapStyle == .topo ? .standard : .topo
+            } label: {
+                Label(model.mapStyle == .topo ? "Topo" : "Map",
+                      systemImage: model.mapStyle == .topo ? "mountain.2.fill" : "map")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(model.mapStyle == .topo ? Color.green : Color(.systemGray),
+                                in: Capsule())
+                    .foregroundStyle(.white)
+                    .shadow(radius: 3)
+            }
             if hike.isActive && !simulate && !following {
                 Button {
                     following = true

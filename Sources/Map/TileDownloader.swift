@@ -14,13 +14,16 @@ struct TileProgress: Equatable {
 actor TileDownloader {
     private let maxConcurrent = 6
 
-    /// Downloads every missing corridor tile, reporting progress on the main
-    /// actor as it goes.
+    /// Downloads every missing corridor tile for `style`, reporting progress on
+    /// the main actor as it goes. Zoom range is capped to what the style serves
+    /// (OpenTopoMap tops out at z17), and tiles land in the style's own cache.
     func download(coords: [CLLocationCoordinate2D],
+                  style: MapStyle = .standard,
                   progress: @escaping @MainActor (TileProgress) -> Void) async {
-        let all = TileMath.corridorTiles(for: coords)
+        let all = TileMath.corridorTiles(for: coords).filter { $0.z <= style.maximumZ }
         let total = all.count
-        let missing = all.filter { !TileStore.exists($0) }
+        let subdir = style.cacheSubdir
+        let missing = all.filter { !TileStore.exists($0, subdir: subdir) }
         var done = total - missing.count
 
         await progress(TileProgress(done: done, total: total))
@@ -31,7 +34,7 @@ actor TileDownloader {
             let slice = Array(missing[index..<min(index + maxConcurrent, missing.count)])
             await withTaskGroup(of: Void.self) { group in
                 for tile in slice {
-                    group.addTask { await Self.fetch(tile) }
+                    group.addTask { await Self.fetch(tile, style: style) }
                 }
                 await group.waitForAll()
             }
@@ -41,15 +44,18 @@ actor TileDownloader {
         }
     }
 
-    private static func fetch(_ tile: TileCoord) async {
-        guard let url = URL(string:
-            "https://tile.openstreetmap.org/\(tile.z)/\(tile.x)/\(tile.y).png") else { return }
+    private static func fetch(_ tile: TileCoord, style: MapStyle) async {
+        let template = style.urlTemplate
+            .replacingOccurrences(of: "{z}", with: String(tile.z))
+            .replacingOccurrences(of: "{x}", with: String(tile.x))
+            .replacingOccurrences(of: "{y}", with: String(tile.y))
+        guard let url = URL(string: template) else { return }
         var request = URLRequest(url: url)
         request.setValue(osmUserAgent, forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 20
         if let (data, response) = try? await URLSession.shared.data(for: request),
            (response as? HTTPURLResponse)?.statusCode == 200 {
-            TileStore.write(data, tile)
+            TileStore.write(data, tile, subdir: style.cacheSubdir)
         }
     }
 }
