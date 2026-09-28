@@ -10,3 +10,7 @@ StayOnTrack.xcodeproj/
 
 # Generated Info.plist (produced by XcodeGen at generate time)
 Sources/Info.plist
+
+# Release artifacts (attached to GitHub releases, not tracked here)
+StayOnTrack.ipa
+stayontrack-installer.zip
