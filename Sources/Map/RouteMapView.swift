@@ -26,6 +26,17 @@ struct RouteMapView: UIViewRepresentable {
     var progressDistance: Double = 0
     /// Device compass heading (true north degrees) → the on-map compass needle.
     var walkerHeading: Double?
+    /// Device compass heading used to ROTATE the map in heading-up mode. Kept
+    /// separate from `walkerHeading`, which is only the needle on the walker and
+    /// is deliberately nil outside a real-GPS hike.
+    var deviceHeading: Double?
+    /// Heading-up: keep the map turned so the phone's facing direction is up the
+    /// screen, so a glance says whether to bear left or right.
+    var headingUp: Bool = false
+    /// Bumped by the UI to request an animated rotation back to north.
+    var northResetToken: Int = 0
+    /// Reports the map's rotation back to the UI, for the compass needle.
+    var onMapHeadingChange: ((Double) -> Void)?
     /// Basemap style: `.standard` OSM or `.topo` (OpenTopoMap contour lines).
     var mapStyle: MapStyle = .standard
 
@@ -37,7 +48,10 @@ struct RouteMapView: UIViewRepresentable {
         map.pointOfInterestFilter = .excludingAll
         map.isRotateEnabled = true    // two-finger rotate; arrows are heading-compensated below
         map.isPitchEnabled = false
-        map.showsCompass = true       // built-in compass appears when rotated; tap it to reset north
+        // Our own compass button replaces MapKit's: it is always visible (not
+        // only when rotated) and carries the two-tap north / heading-up
+        // behaviour, which MKCompassButton can't express.
+        map.showsCompass = false
         let overlay = MapTileOverlay(style: mapStyle)
         map.addOverlay(overlay, level: .aboveLabels)
         context.coordinator.tileOverlay = overlay
@@ -61,6 +75,11 @@ struct RouteMapView: UIViewRepresentable {
         context.coordinator.elevations = elevations
         context.coordinator.progressDistance = progressDistance
         context.coordinator.walkerHeading = walkerHeading
+        context.coordinator.onMapHeadingChange = onMapHeadingChange
+        context.coordinator.applyMapRotation(map,
+                                             headingUp: headingUp,
+                                             deviceHeading: deviceHeading,
+                                             resetToken: northResetToken)
         context.coordinator.sync(map,
                                  coordinates: coordinates,
                                  markers: markers,
@@ -94,6 +113,47 @@ struct RouteMapView: UIViewRepresentable {
         var elevations: [Double?] = []
         var progressDistance: Double = 0
         var walkerHeading: Double?
+        var onMapHeadingChange: ((Double) -> Void)?
+        private var lastReportedHeading: Double = 0
+        private var lastResetToken = 0
+        private var appliedHeading: Double?
+
+        /// Drive the map's rotation: an explicit reset to north, or heading-up
+        /// tracking of the device compass.
+        ///
+        /// Both go through `setCamera` rather than `MKUserTrackingMode`, because
+        /// the walker here is our own annotation (fed by GPS *or* by dragging in
+        /// simulate mode), not MapKit's blue dot.
+        func applyMapRotation(_ map: MKMapView,
+                              headingUp: Bool,
+                              deviceHeading: Double?,
+                              resetToken: Int) {
+            if resetToken != lastResetToken {
+                lastResetToken = resetToken
+                appliedHeading = nil
+                rotate(map, to: 0)
+                return
+            }
+            guard headingUp, let heading = deviceHeading else { return }
+            // The compass reports every 3°; ignore anything smaller still so a
+            // stationary phone's wobble doesn't keep the map in motion.
+            if let applied = appliedHeading, Self.angleDelta(heading, applied) < 2 { return }
+            appliedHeading = heading
+            rotate(map, to: heading)
+        }
+
+        private func rotate(_ map: MKMapView, to heading: Double) {
+            guard abs(map.camera.heading - heading) > 0.5 else { return }
+            let camera = map.camera.copy() as? MKMapCamera ?? map.camera
+            camera.heading = heading
+            map.setCamera(camera, animated: true)
+        }
+
+        /// Smallest absolute angle between two compass bearings (handles 359→1).
+        static func angleDelta(_ a: Double, _ b: Double) -> Double {
+            let d = abs(a - b).truncatingRemainder(dividingBy: 360)
+            return min(d, 360 - d)
+        }
 
         private var routeSegments: [MKPolyline] = []
         private var segmentStyle: [ObjectIdentifier: (width: CGFloat, alpha: CGFloat)] = [:]
@@ -356,11 +416,22 @@ struct RouteMapView: UIViewRepresentable {
         func mapViewDidChangeVisibleRegion(_ map: MKMapView) {
             compensateJunctionHeading(map)
             updateWalkerCompass(map)
+            reportHeading(map)
         }
 
         func mapView(_ map: MKMapView, regionDidChangeAnimated animated: Bool) {
             compensateJunctionHeading(map)
             updateWalkerCompass(map)
+            reportHeading(map)
+        }
+
+        /// Publish the map's rotation so the compass button's needle can follow
+        /// it (and so the button knows whether a first tap should reset north).
+        private func reportHeading(_ map: MKMapView) {
+            let h = map.camera.heading
+            guard abs(h - lastReportedHeading) > 0.5 else { return }
+            lastReportedHeading = h
+            onMapHeadingChange?(h)
         }
 
         func mapView(_ map: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {

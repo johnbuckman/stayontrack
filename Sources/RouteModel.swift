@@ -18,11 +18,12 @@ final class RouteModel: ObservableObject {
         case idle, loading, ready(Int), failed
     }
     @Published var trailState: TrailNetworkState = .idle
-    /// Basemap style, remembered across launches. Switching to `.topo` shows
-    /// OpenTopoMap's elevation contour lines and pre-downloads that corridor so
-    /// it works offline like the standard map.
+    /// Basemap style, remembered across launches. **Topo is the default**: the
+    /// contour lines are what makes a map useful on a climb, so a fresh install
+    /// opens on OpenTopoMap rather than the plain OSM raster. A stored
+    /// preference still wins, so switching to the plain map sticks.
     @Published var mapStyle: MapStyle = MapStyle(rawValue:
-        UserDefaults.standard.string(forKey: "mapStyle") ?? "") ?? .standard {
+        UserDefaults.standard.string(forKey: "mapStyle") ?? "") ?? .topo {
         didSet {
             guard mapStyle != oldValue else { return }
             UserDefaults.standard.set(mapStyle.rawValue, forKey: "mapStyle")
@@ -129,8 +130,9 @@ final class RouteModel: ObservableObject {
         recomputeJunctions()        // geometry turns show immediately (pre-Overpass)
         errorMessage = nil
         rebuildETA()
-        startTileDownload(for: parsed)
-        if mapStyle != .standard { startTileDownload(for: parsed, style: mapStyle) }
+        startTileDownload(for: parsed)                    // plain OSM corridor, z12–16
+        startTileDownload(for: parsed, style: .topo)      // topo corridor, z12–17
+
         startTrailFetch(for: parsed)
         startRestaurantFetch(for: parsed)
         startToiletFetch(for: parsed)
@@ -379,16 +381,22 @@ final class RouteModel: ObservableObject {
         }
     }
 
-    /// Pre-caches the OSM tile corridor so the map works offline on the hike.
+    /// Pre-caches a style's tile corridor so the map works offline on the hike.
+    ///
+    /// Both styles are downloaded at import, so the two run concurrently and
+    /// would otherwise trample each other's published progress. Only the style
+    /// currently on screen reports — the other warms its cache silently.
     private func startTileDownload(for route: GPXRoute, style: MapStyle = .standard) {
         if style == .standard { downloadTask?.cancel() } else { topoDownloadTask?.cancel() }
-        tileProgress = TileProgress(done: 0, total: 0)
-        tileEtaSeconds = nil
-        tileStart = Date()
+        if style == mapStyle {
+            tileProgress = TileProgress(done: 0, total: 0)
+            tileEtaSeconds = nil
+            tileStart = Date()
+        }
         let coords = route.coordinates
         let task = Task { [weak self, downloader] in
             await downloader.download(coords: coords, style: style) { progress in
-                guard let self else { return }
+                guard let self, self.mapStyle == style else { return }
                 self.tileProgress = progress
                 if let start = self.tileStart, progress.done > 0, !progress.isComplete {
                     let elapsed = Date().timeIntervalSince(start)

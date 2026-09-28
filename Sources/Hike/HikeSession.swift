@@ -264,7 +264,13 @@ final class HikeSession: ObservableObject {
         breadcrumb.append(coordinate)
         recorded.append(RecordedPoint(coordinate: coordinate, elevation: ele, time: time))
 
-        if let match { walkerRouteDistance = routeDistance(for: match); routeProgress = walkerRouteDistance }
+        if let match {
+            walkerRouteDistance = routeDistance(for: match)
+            routeProgress = walkerRouteDistance
+            // A re-acquisition means we jumped to a different part of the route,
+            // so re-arm tightly; otherwise re-arm at the wider margin.
+            rearmJunctionsAhead(margin: match.reacquired ? rearmJumpMeters : rearmAheadMeters)
+        }
         announceJunctionsIfNeeded()
         updateHUD()
         updateETAs()
@@ -290,6 +296,35 @@ final class HikeSession: ObservableObject {
     }
 
     // MARK: Voice turns
+
+    /// How far ahead a junction must be before we'll let it speak again.
+    /// Comfortably more than the 20 m at which we announce, so GPS jitter just
+    /// after a cue can't re-arm and immediately repeat it.
+    private let rearmAheadMeters: CLLocationDistance = 60
+    /// Tighter margin after a re-acquisition, where the jump is real and we want
+    /// the junctions just ahead of the new position back as soon as possible.
+    private let rearmJumpMeters: CLLocationDistance = 30
+
+    /// Let junctions that are AHEAD of us again speak again.
+    ///
+    /// `announcedAt` is otherwise write-once: a junction marked spoken stays
+    /// muted forever. Leave the trail, rejoin at a different part of it — or
+    /// simply walk back down it — and every junction now in front of you has
+    /// already been ticked off, so the turn directions go silent. The only cure
+    /// was to kill the app and resume, because `resume()` rebuilds these sets
+    /// from the current position. This does the same thing continuously.
+    ///
+    /// Deliberately run on EVERY fix rather than only on a detected jump: a
+    /// backtrack is gradual (a few metres per fix), so nothing ever looks like a
+    /// jump, and the junctions ahead would stay muted all the way back.
+    private func rearmJunctionsAhead(margin: CLLocationDistance) {
+        for (i, j) in junctions.enumerated()
+        where j.routeDistance > walkerRouteDistance + margin {
+            announcedAt.remove(i)
+            announcedApproach.remove(i)
+            wrongTurnSaid.remove(i)
+        }
+    }
 
     private func announceJunctionsIfNeeded() {
         guard offTrackMeters < 60 else { return }   // don't call turns while well off-route

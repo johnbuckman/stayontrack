@@ -31,9 +31,29 @@ struct PolylineTracker {
     // Global re-acquisition fires only after SUSTAINED loss. On an overlapping
     // route a single transient must NOT trigger it, or it would snap onto the
     // coincident opposite leg.
-    private let lostThreshold = 150.0     // metres off the windowed match
+    //
+    // The threshold is deliberately the same 60 m at which `HikeSession` stops
+    // announcing junctions. It used to be 150 m, which left a dead zone: leave
+    // the trail and rejoin at a part whose distance from the STALE window lands
+    // between 60 and 150 m, and the tracker never re-acquired while the session
+    // refused to speak — turn directions were silently gone until the app was
+    // killed and resumed. The coincident-leg protection is preserved by the
+    // sustained-loss requirement plus `isClearlyBetter`.
+    private let lostThreshold = 60.0      // metres off the windowed match
     private let lostFixesNeeded = 3
     private var lostStreak = 0
+
+    // A global match must beat the windowed one by this much, and by this
+    // factor, before we jump. A marginal improvement is far more likely to be
+    // the opposite leg of an out-and-back than a genuine re-acquisition.
+    private let reacquireMinGain = 30.0
+    private let reacquireMaxRatio = 0.5
+
+    // Two segments of a route that retraces itself sit within metres of each
+    // other, so a global search can pick either. Within this tolerance, prefer
+    // the candidate closest in ROUTE distance to where we thought we were —
+    // you rejoin a trail near where you left it, not on the far leg.
+    private let ambiguousMatchMeters = 10.0
 
     /// Result of matching a position to the route.
     struct Match {
@@ -41,6 +61,10 @@ struct PolylineTracker {
         var segmentIndex: Int
         var t: Double                 // 0...1 along the matched segment
         var elevation: Double?        // interpolated planned elevation at match
+        /// True when this fix re-acquired the route globally, i.e. progress just
+        /// jumped to a different part of the route. `HikeSession` uses it to
+        /// re-arm the junctions that are now ahead again.
+        var reacquired: Bool = false
     }
 
     init(points: [GPXPoint]) {
@@ -76,8 +100,11 @@ struct PolylineTracker {
         if best.offTrackMeters > lostThreshold {
             lostStreak += 1
             if lostStreak >= lostFixesNeeded, pts.count > 2 {
-                let global = search(p, in: 0...(pts.count - 2))
-                if global.offTrackMeters < best.offTrackMeters { best = global }
+                let global = searchGlobal(p)
+                if isClearlyBetter(global, than: best) {
+                    best = global
+                    best.reacquired = true
+                }
                 lostStreak = 0
             }
         } else {
@@ -106,6 +133,45 @@ struct PolylineTracker {
         while lo > 0 && cum[lo] > loD { lo -= 1 }
         while hi < maxSeg && cum[hi] < hiD { hi += 1 }
         return (lo, hi)
+    }
+
+    /// Is a global candidate good enough to abandon the windowed match for?
+    /// It has to be substantially closer in absolute terms AND by a wide margin
+    /// proportionally — a 5 m improvement on a 70 m match means we're lost, not
+    /// re-found, and jumping on it risks landing on the opposite leg.
+    private func isClearlyBetter(_ candidate: Match, than current: Match) -> Bool {
+        candidate.offTrackMeters < current.offTrackMeters - reacquireMinGain
+            && candidate.offTrackMeters < current.offTrackMeters * reacquireMaxRatio
+    }
+
+    /// Nearest point on the WHOLE route, breaking near-ties in favour of the
+    /// candidate closest to our current progress. Without the tie-break a route
+    /// that retraces itself offers two equally good answers kilometres apart,
+    /// and picking the wrong one reverses every turn instruction.
+    private func searchGlobal(_ p: CLLocationCoordinate2D) -> Match {
+        let maxSeg = pts.count - 2
+        var best = search(p, in: 0...maxSeg)
+        // Fixed before the loop: if it tracked `best` it would creep outward as
+        // we accepted slightly-worse-but-closer candidates.
+        let tolerance = best.offTrackMeters + ambiguousMatchMeters
+        var bestGap = abs(routeDistance(of: best) - guessDistance)
+        for i in 0...maxSeg {
+            let (d, t) = Self.distanceToSegment(p, pts[i], pts[i + 1])
+            guard d <= tolerance else { continue }
+            let candidate = Match(offTrackMeters: d, segmentIndex: i, t: t, elevation: nil)
+            let gap = abs(routeDistance(of: candidate) - guessDistance)
+            if gap < bestGap {
+                best = candidate
+                bestGap = gap
+            }
+        }
+        return best
+    }
+
+    /// Route distance (metres from the start) of a match.
+    private func routeDistance(of m: Match) -> Double {
+        let segLen = max(1, cum[m.segmentIndex + 1] - cum[m.segmentIndex])
+        return cum[m.segmentIndex] + m.t * segLen
     }
 
     private func search(_ p: CLLocationCoordinate2D, in range: ClosedRange<Int>) -> Match {

@@ -15,12 +15,14 @@ actor TileDownloader {
     private let maxConcurrent = 6
 
     /// Downloads every missing corridor tile for `style`, reporting progress on
-    /// the main actor as it goes. Zoom range is capped to what the style serves
-    /// (OpenTopoMap tops out at z17), and tiles land in the style's own cache.
+    /// the main actor as it goes. The zoom range is the style's own
+    /// (`cacheZooms` — topo goes a level deeper than standard), capped to what
+    /// the style actually serves, and tiles land in the style's own cache.
     func download(coords: [CLLocationCoordinate2D],
                   style: MapStyle = .standard,
                   progress: @escaping @MainActor (TileProgress) -> Void) async {
-        let all = TileMath.corridorTiles(for: coords).filter { $0.z <= style.maximumZ }
+        let all = TileMath.corridorTiles(for: coords, zooms: style.cacheZooms)
+            .filter { $0.z <= style.maximumZ }
         let total = all.count
         let subdir = style.cacheSubdir
         let missing = all.filter { !TileStore.exists($0, subdir: subdir) }

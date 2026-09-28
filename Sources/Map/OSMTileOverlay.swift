@@ -1,5 +1,6 @@
 import Foundation
 import MapKit
+import UIKit
 
 /// OSM tile usage policy requires a valid, identifying User-Agent.
 /// Personal-use app, so this points at John. Also sent to OpenTopoMap.
@@ -25,6 +26,17 @@ enum MapStyle: String, CaseIterable, Codable {
     /// OpenTopoMap's tiles stop at z17; OSM goes to z19.
     var maximumZ: Int {
         switch self { case .standard: return 19; case .topo: return 17 }
+    }
+
+    /// Zoom levels pre-cached for offline use at import.
+    ///
+    /// Topo goes all the way to z17 — it is the map John actually hikes on, and
+    /// z17 is where the contour lines become readable. Standard stops at z16;
+    /// beyond that it falls back to upscaled z16 tiles (`TileUpscaler`), which
+    /// is fine for a map he only glances at. z17 quadruples the tile count, so
+    /// it is cached over a narrower corridor — see `TileMath.bufferMeters(for:)`.
+    var cacheZooms: ClosedRange<Int> {
+        switch self { case .standard: return 12...16; case .topo: return 12...17 }
     }
 }
 
@@ -123,14 +135,42 @@ final class MapTileOverlay: MKTileOverlay {
         }
         var request = URLRequest(url: url(forTilePath: path))
         request.setValue(osmUserAgent, forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        // Short: on the trail there is no network at all, and we'd rather show
+        // the upscaled fallback promptly than leave the map blank for 60 s.
+        request.timeoutInterval = 8
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             if let data,
                (response as? HTTPURLResponse)?.statusCode == 200 {
                 TileStore.write(data, coord, subdir: subdir)
                 result(data, nil)
+            } else if let standIn = self?.upscaledAncestor(of: coord) {
+                // Offline (or the tile simply isn't served at this zoom): show
+                // the best cached tile we do have, stretched to fit.
+                result(standIn, nil)
             } else {
                 result(data, error)
             }
         }.resume()
+    }
+
+    /// Nearest cached lower-zoom tile covering `coord`, cropped to the right
+    /// quadrant and blown up to tile size. Nil if nothing within reach is
+    /// cached. Never stored — see `TileUpscaler`.
+    private func upscaledAncestor(of coord: TileCoord) -> Data? {
+        let subdir = style.cacheSubdir
+        for levelsUp in 1...TileUpscaler.maxLevelsUp {
+            let z = coord.z - levelsUp
+            guard z >= minimumZ else { break }
+            let parent = TileUpscaler.ancestor(of: coord, levelsUp: levelsUp)
+            guard let data = TileStore.read(parent, subdir: subdir),
+                  let image = UIImage(data: data) else { continue }
+            let grid = 1 << levelsUp                       // tiles per ancestor edge
+            return TileUpscaler.upscale(image,
+                                        gridSize: grid,
+                                        x: coord.x - (parent.x << levelsUp),
+                                        y: coord.y - (parent.y << levelsUp),
+                                        to: tileSize)
+        }
+        return nil
     }
 }

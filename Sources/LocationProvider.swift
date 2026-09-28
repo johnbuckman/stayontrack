@@ -16,6 +16,9 @@ final class LocationProvider: NSObject, ObservableObject {
 
     private let manager = CLLocationManager()
     private var wantUpdates = false
+    /// The heading-up map mode wants the compass even when no hike is running
+    /// (and the compass, unlike GPS, needs no authorization).
+    private var wantHeading = false
 
     override init() {
         super.init()
@@ -49,6 +52,31 @@ final class LocationProvider: NSObject, ObservableObject {
         manager.allowsBackgroundLocationUpdates = false
         #endif
         manager.stopUpdatingLocation()
+        if !wantHeading { stopHeadingUpdates() }
+    }
+
+    /// Does this device have a magnetometer at all? False on the Mac Catalyst
+    /// dev build, where the map can only be north-up.
+    var headingAvailable: Bool { CLLocationManager.headingAvailable() }
+
+    /// Compass only, no GPS — for rotating the map to the phone's facing
+    /// direction outside a hike. No-op where there's no magnetometer (the Mac
+    /// Catalyst dev build), which leaves `heading` nil and the map north-up.
+    func startHeading() {
+        wantHeading = true
+        guard CLLocationManager.headingAvailable() else { return }
+        manager.headingFilter = 3            // degrees
+        manager.startUpdatingHeading()
+    }
+
+    /// Stops the compass unless a running hike still needs it for the needle.
+    func stopHeading() {
+        wantHeading = false
+        guard !wantUpdates else { return }
+        stopHeadingUpdates()
+    }
+
+    private func stopHeadingUpdates() {
         manager.stopUpdatingHeading()
         heading = nil
     }

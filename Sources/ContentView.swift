@@ -19,6 +19,13 @@ struct ContentView: View {
     }()
     @State private var following = true         // auto-recenter on the walker
 
+    // Two-tap compass. Tap 1 turns a rotated map back to north; tap 2 (already
+    // north-up) switches to heading-up, where the map turns with the phone so
+    // you can hold it in front of you and see which way to bear; tap 3 is off.
+    @State private var headingUp = false
+    @State private var mapHeading: Double = 0
+    @State private var northResetToken = 0
+
     /// The junction HUD banner occupies the top-centre while hiking; the
     /// top-corner buttons (recenter/food, stop, calculating badge) drop below it
     /// by this much so nothing overlaps the banner.
@@ -190,6 +197,10 @@ struct ContentView: View {
                      elevations: model.travelPoints.map(\.elevation),
                      progressDistance: hike.isActive ? hike.routeProgress : 0,
                      walkerHeading: hike.isActive && !simulate ? location.heading : nil,
+                     deviceHeading: location.heading,
+                     headingUp: headingUp,
+                     northResetToken: northResetToken,
+                     onMapHeadingChange: { mapHeading = $0 },
                      mapStyle: model.mapStyle)
             .ignoresSafeArea()
             .overlay(alignment: .top) { junctionHUD }
@@ -329,6 +340,52 @@ struct ContentView: View {
     }
 
     /// Shown when a real walk is in progress but the user has panned away.
+    /// Two-tap compass, replacing MapKit's (which only appears once the map is
+    /// already rotated). The needle always shows which way north is on screen;
+    /// the label says the mode you're in.
+    ///
+    /// Tap 1 on a rotated map turns it back to north. Tap 2, with the map
+    /// already north-up, switches to **heading-up**: the map turns with the
+    /// phone, so you hold it in front of you and see at a glance whether the
+    /// trail bears left or right. Tap 3 returns to north-up.
+    ///
+    /// Hardware without a magnetometer (the Mac Catalyst dev build) skips the
+    /// heading-up step entirely — the button is then just "reset north".
+    @ViewBuilder private var compassButton: some View {
+        Button(action: tapCompass) {
+            Label {
+                Text(headingUp ? "Ahead" : "North")
+            } icon: {
+                Image(systemName: "location.north.fill")
+                    .rotationEffect(.degrees(-mapHeading))
+            }
+            .font(.subheadline.weight(.semibold))
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(headingUp ? Color.green : Color(.systemGray), in: Capsule())
+            .foregroundStyle(.white)
+            .shadow(radius: 3)
+        }
+    }
+
+    /// True once the map is turned appreciably off north.
+    private var mapIsRotated: Bool {
+        let d = abs(mapHeading.truncatingRemainder(dividingBy: 360))
+        return min(d, 360 - d) > 1
+    }
+
+    private func tapCompass() {
+        if headingUp {                          // heading-up → north-up
+            headingUp = false
+            location.stopHeading()
+            northResetToken += 1
+        } else if mapIsRotated || !location.headingAvailable {
+            northResetToken += 1                // turn a rotated map back to north
+        } else {                                // already north-up → heading-up
+            headingUp = true
+            location.startHeading()
+        }
+    }
+
     @ViewBuilder private var recenterButton: some View {
         VStack(alignment: .leading, spacing: 10) {
             Button {
@@ -343,6 +400,7 @@ struct ContentView: View {
                     .foregroundStyle(.white)
                     .shadow(radius: 3)
             }
+            compassButton
             if hike.isActive && !simulate && !following {
                 Button {
                     following = true
