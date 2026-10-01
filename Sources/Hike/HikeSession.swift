@@ -27,6 +27,11 @@ final class HikeSession: ObservableObject {
     @Published private(set) var paceDeltaPercent: Double?    // + faster, − slower than calc
     @Published private(set) var lastAnnouncement: String?
 
+    /// Whether the hike is paused (manually or automatically). While paused the
+    /// clock is frozen and incoming GPS is discarded, so a lunch break neither
+    /// counts toward elapsed time nor drags down the pace ETA.
+    @Published private(set) var isPaused = false
+
     // The junction to surface in the top HUD (and later the Lock Screen).
     @Published private(set) var hudJunction: Junction?
     @Published private(set) var hudMeters: Double = 0
@@ -38,7 +43,34 @@ final class HikeSession: ObservableObject {
 
     private let elevationNoiseFloor = 1.0
     let offTrailThreshold: CLLocationDistance = 100
-    private let paceReadyAfter: TimeInterval = 600   // withhold pace-ETA for 10 min
+
+    // Pace ETA — a rolling window of recent *moving* travel, so breaks (and the
+    // minutes right after resuming) don't skew it. The old code divided total
+    // distance by total wall-clock elapsed, so one lunch stop inflated the ETA
+    // for the rest of the hike.
+    private struct PaceSample { let time: Date; let dist: CLLocationDistance }
+    private var paceSamples: [PaceSample] = []           // (fix time, cumulative distance walked)
+    private let paceWindow: TimeInterval = 15 * 60       // consider only the last 15 min
+    /// Segments slower than this count as "stopped" and are dropped from the
+    /// pace. 200 m/h — well below the ~1 km/h of genuinely hard hiking, which we
+    /// still want to count, but above GPS jitter while standing still.
+    private let movingSpeedFloor: CLLocationDistance = 200.0 / 3600.0   // m/s
+    private let paceReadyMovingTime: TimeInterval = 120  // need 2 min of moving data…
+    private let paceReadyMovingDist: CLLocationDistance = 50   // …and 50 m, before showing it
+    private var movingElapsed: TimeInterval = 0          // lifetime moving time, for "pace vs calc"
+    private var lastIngestTime: Date?                    // for per-fix moving-time deltas
+
+    // Pause (manual + automatic) bookkeeping.
+    private var pauseIsAutomatic = false
+    private var pauseStart: Date?                        // when the current pause began
+    private var pausedTotal: TimeInterval = 0            // accumulated paused time, subtracted from elapsed
+    private var pauseAnchorCoord: CLLocationCoordinate2D?  // position at auto-pause, for auto-resume
+    private var pendingResumeReanchor = false            // skip the first post-resume distance step
+    private let autoPauseAfter: TimeInterval = 3 * 60    // auto-pause after 3 min with no movement
+    private let autoPauseRadius: CLLocationDistance = 20 // "no movement" = stayed within 20 m
+    private let autoResumeDistance: CLLocationDistance = 25  // leave an auto-pause after moving 25 m
+    private var stationaryAnchor: CLLocationCoordinate2D?
+    private var stationaryAnchorSince: Date?
 
     // Off-trail spoken distances (replaces the old rising-pitch tone).
     private let offTrailBands: [Double] = [20, 50, 100]
@@ -121,6 +153,10 @@ final class HikeSession: ObservableObject {
         distanceWalked = 0; elevationGain = 0; offTrackMeters = 0; elapsed = 0
         lastElevation = nil; walkerRouteDistance = 0
         etaCalcText = "—"; etaPaceText = "—"; paceDeltaPercent = nil
+        paceSamples = []; movingElapsed = 0; lastIngestTime = nil
+        isPaused = false; pauseIsAutomatic = false; pauseStart = nil; pausedTotal = 0
+        pauseAnchorCoord = nil; pendingResumeReanchor = false
+        stationaryAnchor = nil; stationaryAnchorSince = nil
         lastAnnouncement = nil; hudJunction = nil; hudMeters = 0
         routeName = name
         startDate = Date()
@@ -166,6 +202,10 @@ final class HikeSession: ObservableObject {
         walker = breadcrumb.last
         elapsed = Date().timeIntervalSince(cp.startDate)
 
+        paceSamples = []; movingElapsed = 0; lastIngestTime = nil
+        isPaused = false; pauseIsAutomatic = false; pauseStart = nil; pausedTotal = 0
+        pauseAnchorCoord = nil; pendingResumeReanchor = false
+        stationaryAnchor = nil; stationaryAnchorSince = nil
         offTrailBandAnnounced = 0; fastSince = nil; lastFixTime = nil; strayOutstanding = false
         wrongTurnSaid = []; wrongTurnActive = false; repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
 
@@ -202,7 +242,56 @@ final class HikeSession: ObservableObject {
         audio.stop(); voice.stop(); presenter.end()
         phase = .idle
         walker = nil; breadcrumb = []; recorded = []
+        isPaused = false; pauseStart = nil; pausedTotal = 0
         HikeCheckpointStore.clear()
+    }
+
+    // MARK: Pause / resume
+
+    /// The Pause/Resume button toggles a manual pause.
+    func togglePause() {
+        if isPaused { resumeWalk() } else { pauseWalk(automatic: false) }
+    }
+
+    /// Pause the hike: freeze the clock and discard incoming GPS until resumed.
+    /// A manual pause waits for the button; an automatic one also resumes as soon
+    /// as real movement is seen again.
+    func pauseWalk(automatic: Bool) {
+        guard phase == .active, !isPaused else { return }
+        isPaused = true
+        pauseIsAutomatic = automatic
+        pauseStart = Date()
+        pauseAnchorCoord = walker
+        let msg = automatic ? "Auto paused" : "Paused"
+        lastAnnouncement = msg
+        voice.speak(msg)
+        saveCheckpoint()
+    }
+
+    func resumeWalk() {
+        guard phase == .active, isPaused else { return }
+        if let ps = pauseStart { pausedTotal += Date().timeIntervalSince(ps) }
+        pauseStart = nil
+        isPaused = false
+        pauseIsAutomatic = false
+        pauseAnchorCoord = nil
+        // The next fix must not count the walked-away gap as one giant step, and
+        // the break must not look like car-speed travel or stale moving-time.
+        pendingResumeReanchor = true
+        lastIngestTime = nil
+        lastFixTime = nil
+        stationaryAnchor = nil; stationaryAnchorSince = nil
+        lastAnnouncement = "Resumed"
+        voice.speak("Resumed")
+        saveCheckpoint()
+    }
+
+    /// Elapsed hiking time with paused spans removed.
+    private func activeElapsed() -> TimeInterval {
+        guard let start = startDate else { return 0 }
+        var e = Date().timeIntervalSince(start) - pausedTotal
+        if let ps = pauseStart { e -= Date().timeIntervalSince(ps) }
+        return max(0, e)
     }
 
     /// Swap in a freshly-computed junction set for the hike already in progress.
@@ -247,18 +336,42 @@ final class HikeSession: ObservableObject {
     func ingest(coordinate: CLLocationCoordinate2D, elevation: Double?, time: Date) {
         guard phase == .active else { return }
 
+        // While paused, discard fixes — except an automatic pause ends the moment
+        // real movement resumes, and that fix is then processed normally.
+        if isPaused {
+            walker = coordinate   // keep the map dot roughly current
+            if pauseIsAutomatic, let anchor = pauseAnchorCoord,
+               CLLocation(from: anchor).distance(from: CLLocation(from: coordinate)) >= autoResumeDistance {
+                resumeWalk()
+            }
+            if isPaused { return }
+        }
+
         let match = tracker?.match(coordinate)
         offTrackMeters = match?.offTrackMeters ?? 0
         let ele = elevation ?? match?.elevation
 
-        if let last = breadcrumb.last {
+        // Skip the distance step on the first fix after a resume so the gap walked
+        // away (or GPS drift over a long break) isn't booked as travel.
+        if let last = breadcrumb.last, !pendingResumeReanchor {
             let step = CLLocation(from: last).distance(from: CLLocation(from: coordinate))
             distanceWalked += step
+            if let lt = lastIngestTime {
+                let dt = time.timeIntervalSince(lt)
+                if dt > 0, step / dt >= movingSpeedFloor { movingElapsed += dt }
+            }
             if let ele, let prev = lastElevation {
                 let climb = ele - prev
                 if climb > elevationNoiseFloor { elevationGain += climb }
             }
         }
+        pendingResumeReanchor = false
+        lastIngestTime = time
+        // Rolling pace window: record cumulative distance at this fix, drop samples
+        // older than the window.
+        paceSamples.append(PaceSample(time: time, dist: distanceWalked))
+        let paceCutoff = time.addingTimeInterval(-paceWindow)
+        while paceSamples.count > 2 && paceSamples[1].time < paceCutoff { paceSamples.removeFirst() }
         if ele != nil { lastElevation = ele }
         walker = coordinate
         breadcrumb.append(coordinate)
@@ -279,6 +392,7 @@ final class HikeSession: ObservableObject {
         checkStalledAtJunction(coordinate: coordinate, time: time)
         checkAutoStop(coordinate: coordinate, time: time)
         guard phase == .active else { return }   // an auto-stop may have ended the hike
+        checkAutoPause(coordinate: coordinate, time: time)
 
         // Checkpoint every few fixes so a crash loses at most a few seconds.
         fixesSinceCheckpoint += 1
@@ -454,6 +568,22 @@ final class HikeSession: ObservableObject {
         stop()
     }
 
+    /// Auto-pause when you've stayed within `autoPauseRadius` for `autoPauseAfter`
+    /// (3 min) — a rest you forgot to pause for. Reset the anchor whenever you
+    /// move off it, so only genuine stillness trips it.
+    private func checkAutoPause(coordinate: CLLocationCoordinate2D, time: Date) {
+        guard phase == .active, !isPaused else { return }
+        guard let anchor = stationaryAnchor, let since = stationaryAnchorSince else {
+            stationaryAnchor = coordinate; stationaryAnchorSince = time; return
+        }
+        let moved = CLLocation(from: anchor).distance(from: CLLocation(from: coordinate))
+        if moved > autoPauseRadius {
+            stationaryAnchor = coordinate; stationaryAnchorSince = time
+        } else if time.timeIntervalSince(since) >= autoPauseAfter {
+            pauseWalk(automatic: true)
+        }
+    }
+
     // MARK: HUD — the next junction and distance to it
 
     private func updateHUD() {
@@ -481,20 +611,39 @@ final class HikeSession: ObservableObject {
         let secs = Int(calcRemaining.rounded())
         timeLeftText = String(format: "%d:%02d", secs / 3600, (secs % 3600) / 60)
 
-        if elapsed >= paceReadyAfter, distanceWalked > 0 {
-            let pace = distanceWalked / elapsed                       // m/s
+        // Pace ETA from the last 15 min of *moving* travel (breaks excluded), so a
+        // lunch stop no longer inflates it. Blank until there's enough moving data.
+        if let pace = recentMovingPace(), pace > 0 {
             let remainingDist = max(0, eta.totalDistance - walkerRouteDistance)
-            if pace > 0 {
-                etaPaceText = clock.string(from: now.addingTimeInterval(remainingDist / pace))
-            }
+            etaPaceText = clock.string(from: now.addingTimeInterval(remainingDist / pace))
         }
 
         // How actual pace compares to the grade-adjusted model, as a %.
-        // + = faster than calculated, − = slower. Needs a little distance first.
-        if elapsed > 60, walkerRouteDistance > 30 {
+        // + = faster than calculated, − = slower. Measured against moving time (not
+        // raw elapsed) so a rest doesn't read as "slower".
+        if movingElapsed > 60, walkerRouteDistance > 30 {
             let expected = eta.expectedTime(toDistance: walkerRouteDistance)
-            paceDeltaPercent = expected > 0 ? (expected / elapsed - 1) * 100 : nil
+            paceDeltaPercent = expected > 0 ? (expected / movingElapsed - 1) * 100 : nil
         }
+    }
+
+    /// Recent moving pace (m/s): over the last `paceWindow`, the distance covered
+    /// in segments at or above `movingSpeedFloor`, divided by the time of those
+    /// segments. Nil until there's at least `paceReadyMovingTime`/`paceReadyMovingDist`.
+    private func recentMovingPace() -> CLLocationDistance? {
+        guard paceSamples.count >= 2 else { return nil }
+        let cutoff = paceSamples[paceSamples.count - 1].time.addingTimeInterval(-paceWindow)
+        var movingDist = 0.0, movingTime = 0.0
+        for i in 1..<paceSamples.count {
+            let a = paceSamples[i - 1], b = paceSamples[i]
+            if b.time < cutoff { continue }
+            let dt = b.time.timeIntervalSince(a.time)
+            let dd = b.dist - a.dist
+            guard dt > 0 else { continue }
+            if dd / dt >= movingSpeedFloor { movingDist += dd; movingTime += dt }
+        }
+        guard movingTime >= paceReadyMovingTime, movingDist >= paceReadyMovingDist else { return nil }
+        return movingDist / movingTime
     }
 
     /// Grade-adjusted time remaining to the finish, as h:mm — the "time left in
@@ -522,8 +671,8 @@ final class HikeSession: ObservableObject {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                guard let self, let start = self.startDate, self.phase == .active else { return }
-                self.elapsed = Date().timeIntervalSince(start)
+                guard let self, self.startDate != nil, self.phase == .active else { return }
+                self.elapsed = self.activeElapsed()   // frozen while paused
             }
         }
     }

@@ -289,19 +289,32 @@ struct ContentView: View {
         }
     }
 
-    /// Small stop control at the top-right.
+    /// Stop control at the top-right, with a Pause/Resume button beneath it.
     @ViewBuilder private var stopIcon: some View {
         if hike.isActive {
-            Button { showStopConfirm = true } label: {
-                Image(systemName: "stop.circle.fill")
-                    .font(.system(size: 32))
-                    .symbolRenderingMode(.palette)
-                    .foregroundStyle(.white, .red)
-                    .shadow(radius: 2)
-                    .padding(10)
-                    .contentShape(Rectangle())
+            VStack(spacing: 4) {
+                Button { showStopConfirm = true } label: {
+                    Image(systemName: "stop.circle.fill")
+                        .font(.system(size: 32))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .red)
+                        .shadow(radius: 2)
+                        .padding(10)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Button { hike.togglePause() } label: {
+                    Image(systemName: hike.isPaused ? "play.circle.fill" : "pause.circle.fill")
+                        .font(.system(size: 32))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, hike.isPaused ? .green : .orange)
+                        .shadow(radius: 2)
+                        .padding(10)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(hike.isPaused ? "Resume walk" : "Pause walk")
             }
-            .buttonStyle(.plain)
             .padding(.trailing, 8)
             .padding(.top, hudBannerVisible ? hudBannerDrop : 2)   // drop below the HUD banner
         }
@@ -639,7 +652,8 @@ struct ContentView: View {
     private var activeControls: some View {
         VStack(spacing: 12) {
             HStack(spacing: 0) {
-                stat("Time", hike.elapsedText)
+                stat(hike.isPaused ? "Time (paused)" : "Time", hike.elapsedText,
+                     tint: hike.isPaused ? .orange : .primary)
                 stat("Walked", hike.distanceWalkedText)
                 stat("Climb", hike.elevationGainText)
                 stat("Off-trail", hike.offTrackText,

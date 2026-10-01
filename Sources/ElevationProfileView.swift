@@ -151,6 +151,58 @@ struct ElevationProfileView: View {
                               at: CGPoint(x: min(max(px, 30), size.width - 30), y: py + 9),
                               anchor: .top)
                 }
+
+                // Label each PROMINENT local trough the same way — a downward
+                // triangle above the dip with its (usually negative) height
+                // relative to where you're standing, so an upcoming descent is as
+                // visible as an upcoming climb.
+                var lastTroughX: CGFloat = -1000
+                for i in 1..<(remaining.count - 1) {
+                    guard elevs[i] <= elevs[i - 1], elevs[i] < elevs[i + 1] else { continue }
+                    let lo = max(0, i - window), hi = min(elevs.count - 1, i + window)
+                    let localMax = elevs[lo...hi].max() ?? elevs[i]
+                    guard localMax - elevs[i] >= prominence else { continue }
+                    let px = x(remaining[i].distance), py = y(elevs[i])
+                    guard px - lastTroughX >= 40 else { continue }   // don't crowd labels
+                    lastTroughX = px
+                    var tri = Path()                                 // ▼ pointing down at the trough
+                    tri.move(to: CGPoint(x: px, y: py - 2))
+                    tri.addLine(to: CGPoint(x: px - 4, y: py - 9))
+                    tri.addLine(to: CGPoint(x: px + 4, y: py - 9))
+                    tri.closeSubpath()
+                    ctx.fill(tri, with: .color(.white))
+                    drawLabel(Text(String(format: "%+d m", rel(elevs[i])))
+                                .font(.system(size: 12, weight: .bold)),
+                              at: CGPoint(x: min(max(px, 30), size.width - 30), y: py - 11),
+                              anchor: .bottom)
+                }
+
+                // The finish itself is never an interior peak/trough, so a steady
+                // climb or descent to the end (e.g. the long drop after a summit)
+                // would otherwise carry no number. Label the endpoint with its net
+                // height relative to where you're standing when that's meaningful.
+                if let end = remaining.last {
+                    let r = rel(end.elevation)
+                    if abs(r) >= Int(prominence) {
+                        let px = x(end.distance), py = y(end.elevation)
+                        let clampedX = min(max(px, 30), size.width - 30)
+                        var tri = Path()
+                        tri.move(to: CGPoint(x: px, y: py - 2))
+                        tri.addLine(to: CGPoint(x: px - 4, y: py - 9))
+                        tri.addLine(to: CGPoint(x: px + 4, y: py - 9))
+                        tri.closeSubpath()
+                        ctx.fill(tri, with: .color(.white))
+                        // Drop below for a high finish, float above for a low one,
+                        // so the label clears the terrain either way.
+                        if r >= 0 {
+                            drawLabel(Text(String(format: "%+d m", r)).font(.system(size: 12, weight: .bold)),
+                                      at: CGPoint(x: clampedX, y: py + 9), anchor: .top)
+                        } else {
+                            drawLabel(Text(String(format: "%+d m", r)).font(.system(size: 12, weight: .bold)),
+                                      at: CGPoint(x: clampedX, y: py - 11), anchor: .bottom)
+                        }
+                    }
+                }
             }
 
             // Forecast temperature line over the SAME x-axis (distance → the
