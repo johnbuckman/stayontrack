@@ -22,7 +22,7 @@ actor TileDownloader {
                   style: MapStyle = .standard,
                   progress: @escaping @MainActor (TileProgress) -> Void) async {
         let all = TileMath.corridorTiles(for: coords, zooms: style.cacheZooms)
-            .filter { $0.z <= style.maximumZ }
+            .filter { $0.z <= style.serverMaximumZ }
         let total = all.count
         let subdir = style.cacheSubdir
         let missing = all.filter { !TileStore.exists($0, subdir: subdir) }

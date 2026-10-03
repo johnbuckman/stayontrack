@@ -633,9 +633,9 @@ struct ContentView: View {
     @ViewBuilder private var combinedStatus: some View {
         HStack(spacing: 6) {
             if let p = model.tileProgress {
-                Image(systemName: p.isComplete ? "checkmark.circle.fill" : "arrow.down.circle")
+                Image(systemName: p.isComplete ? "airplane.circle.fill" : "arrow.down.circle")
                     .foregroundStyle(p.isComplete ? .green : .secondary)
-                Text(p.isComplete ? "\(p.total) tiles" : "caching \(p.done)/\(p.total)")
+                Text(p.isComplete ? "offline ready" : "saving maps \(p.done)/\(p.total)")
             }
             switch model.trailState {
             case .ready(let c): Text("· \(c) turns")
@@ -698,17 +698,22 @@ struct ContentView: View {
 
     // MARK: Bits
 
+    /// Pre-download status on the start page, written around the question John
+    /// actually asks it: can I put the phone in airplane mode yet? It covers
+    /// BOTH basemaps, since both are cached at import and finishing one of them
+    /// is not the same as being safe to fly.
     @ViewBuilder private var tileStatus: some View {
         if let progress = model.tileProgress {
             HStack(spacing: 8) {
                 if progress.isComplete {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Offline map ready (\(progress.total) tiles)")
-                        .font(.footnote).foregroundStyle(.secondary)
+                    Image(systemName: "airplane.circle.fill").foregroundStyle(.green)
+                    Text("Maps saved — safe for airplane mode (\(progress.total) tiles)")
+                        .font(.footnote.weight(.medium)).foregroundStyle(.green)
                 } else {
                     ProgressView(value: progress.fraction).frame(width: 90)
-                    Text("Caching map \(progress.done)/\(progress.total)"
-                         + etaSuffix(model.tileEtaSeconds))
+                    Text("Saving maps for offline \(progress.done)/\(progress.total)"
+                         + etaSuffix(model.tileEtaSeconds)
+                         + " — stay online")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Spacer()

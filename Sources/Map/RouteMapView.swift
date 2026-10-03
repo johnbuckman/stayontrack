@@ -436,7 +436,11 @@ struct RouteMapView: UIViewRepresentable {
 
         func mapView(_ map: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let tile = overlay as? MKTileOverlay {
-                return MKTileOverlayRenderer(tileOverlay: tile)
+                let r = MKTileOverlayRenderer(tileOverlay: tile)
+                // Hand the overlay its renderer so a real tile arriving late can
+                // replace the magnified stand-in shown in its place.
+                (tile as? MapTileOverlay)?.renderer = r
+                return r
             }
             if let line = overlay as? MKPolyline {
                 let r = MKPolylineRenderer(polyline: line)

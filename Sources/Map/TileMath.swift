@@ -10,10 +10,17 @@ struct TileCoord: Hashable {
 
 /// Slippy-map math + corridor tile enumeration (Web Mercator, EPSG:3857).
 enum TileMath {
-    /// Zoom levels we cache for offline use: overview down to trail detail.
-    /// This is the floor every style shares; a style may cache deeper (see
-    /// `MapStyle.cacheZooms`).
-    static let zoomRange: ClosedRange<Int> = 12...16
+    /// Zoom levels we cache for offline use: whole-world overview down to trail
+    /// detail. This is the floor every style shares; a style may cache deeper
+    /// (see `MapStyle.cacheZooms`).
+    ///
+    /// It starts at 0, not 12, and that matters: the overlay's `minimumZ` comes
+    /// from here, and MapKit silently stops requesting tiles below it — so a
+    /// floor of 12 meant zooming OUT past z12 blanked the map exactly like
+    /// zooming in past the top. Levels 0–11 are nearly free (the corridor is one
+    /// or two tiles wide at that scale), so caching them costs almost nothing
+    /// and makes zooming out work offline too.
+    static let zoomRange: ClosedRange<Int> = 0...16
 
     /// How far either side of the route we cache (metres). Comfortably beyond
     /// the 100 m off-trail threshold so straying never hits a blank tile.

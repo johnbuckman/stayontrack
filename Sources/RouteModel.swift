@@ -12,7 +12,26 @@ final class RouteModel: ObservableObject {
         didSet { recomputeMarkers(); recomputeJunctions(); rebuildETA() }
     }
     @Published var errorMessage: String?
-    @Published var tileProgress: TileProgress?
+    /// Pre-download progress per basemap style. BOTH styles are cached at
+    /// import, so a single figure would silently ignore half the work — and the
+    /// whole point of this readout is telling John when it is safe to switch the
+    /// phone to airplane mode.
+    @Published var tileProgressByStyle: [MapStyle: TileProgress] = [:]
+
+    /// The two corridors added together: what is actually left to download.
+    var tileProgress: TileProgress? {
+        guard !tileProgressByStyle.isEmpty else { return nil }
+        let done = tileProgressByStyle.values.reduce(0) { $0 + $1.done }
+        let total = tileProgressByStyle.values.reduce(0) { $0 + $1.total }
+        return TileProgress(done: done, total: total)
+    }
+
+    /// True once every style's corridor is fully cached — i.e. the map works
+    /// with the radios off.
+    var offlineMapReady: Bool {
+        guard let p = tileProgress, p.total > 0 else { return false }
+        return p.isComplete
+    }
 
     enum TrailNetworkState: Equatable {
         case idle, loading, ready(Int), failed
@@ -130,8 +149,17 @@ final class RouteModel: ObservableObject {
         recomputeJunctions()        // geometry turns show immediately (pre-Overpass)
         errorMessage = nil
         rebuildETA()
-        startTileDownload(for: parsed)                    // plain OSM corridor, z12–16
-        startTileDownload(for: parsed, style: .topo)      // topo corridor, z12–17
+        startTileDownload(for: parsed)                    // plain OSM corridor
+        startTileDownload(for: parsed, style: .topo)      // topo corridor, one level deeper
+        #if DEBUG
+        // Opt-in: run the app with -tileSelfCheck to have every zoom level
+        // probed and logged. Off by default so an ordinary import isn't doing
+        // ~46 extra tile loads.
+        if UserDefaults.standard.bool(forKey: "tileSelfCheck"),
+           let first = parsed.coordinates.first {
+            for style in MapStyle.allCases { TileSelfCheck.run(at: first, style: style) }
+        }
+        #endif
 
         startTrailFetch(for: parsed)
         startRestaurantFetch(for: parsed)
@@ -388,22 +416,21 @@ final class RouteModel: ObservableObject {
     /// currently on screen reports — the other warms its cache silently.
     private func startTileDownload(for route: GPXRoute, style: MapStyle = .standard) {
         if style == .standard { downloadTask?.cancel() } else { topoDownloadTask?.cancel() }
-        if style == mapStyle {
-            tileProgress = TileProgress(done: 0, total: 0)
-            tileEtaSeconds = nil
-            tileStart = Date()
-        }
+        tileProgressByStyle[style] = TileProgress(done: 0, total: 0)
+        tileEtaSeconds = nil
+        if tileStart == nil || offlineMapReady { tileStart = Date() }
         let coords = route.coordinates
         let task = Task { [weak self, downloader] in
             await downloader.download(coords: coords, style: style) { progress in
-                guard let self, self.mapStyle == style else { return }
-                self.tileProgress = progress
-                if let start = self.tileStart, progress.done > 0, !progress.isComplete {
+                guard let self else { return }
+                self.tileProgressByStyle[style] = progress
+                // ETA is for the WHOLE pre-download, both styles together.
+                guard let overall = self.tileProgress else { return }
+                if let start = self.tileStart, overall.done > 0, !overall.isComplete {
                     let elapsed = Date().timeIntervalSince(start)
-                    let rate = Double(progress.done) / max(elapsed, 0.001)   // tiles/sec
-                    if rate > 0 {
-                        self.tileEtaSeconds = Double(progress.total - progress.done) / rate
-                    }
+                    let rate = Double(overall.done) / max(elapsed, 0.001)   // tiles/sec
+                    self.tileEtaSeconds = rate > 0
+                        ? Double(overall.total - overall.done) / rate : nil
                 } else {
                     self.tileEtaSeconds = nil
                 }

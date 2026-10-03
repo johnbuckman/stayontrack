@@ -15,10 +15,15 @@ import UIKit
 /// rendering fallback, not data, and caching it would mean a later online visit
 /// keeps serving mush instead of fetching the real tile.
 enum TileUpscaler {
-    /// How many zoom levels up we'll look. Each level quarters the source area,
-    /// so by 5 levels a 256 px tile contributes an 8 px patch — past that it is
-    /// coloured fog rather than a map.
-    static let maxLevelsUp = 5
+    /// How many zoom levels up we'll look for something to magnify.
+    ///
+    /// Generous on purpose. Each level quarters the source area, so deep down
+    /// the patch is only a few pixels and the result is coloured fog — but fog
+    /// still shows the shape of the terrain, and the alternative at that depth
+    /// is a blank screen. A tight limit here is just another way to make the
+    /// map disappear when you zoom too far, which is the bug this exists to
+    /// prevent. The search stops at the overlay's `minimumZ` anyway.
+    static let maxLevelsUp = 14
 
     /// The ancestor `levelsUp` zoom levels above `t` (the tile that contains it).
     static func ancestor(of t: TileCoord, levelsUp: Int) -> TileCoord {
