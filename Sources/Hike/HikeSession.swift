@@ -66,11 +66,12 @@ final class HikeSession: ObservableObject {
     private var pausedTotal: TimeInterval = 0            // accumulated paused time, subtracted from elapsed
     private var pauseAnchorCoord: CLLocationCoordinate2D?  // position at auto-pause, for auto-resume
     private var pendingResumeReanchor = false            // skip the first post-resume distance step
-    private let autoPauseAfter: TimeInterval = 3 * 60    // auto-pause after 3 min with no movement
-    private let autoPauseRadius: CLLocationDistance = 20 // "no movement" = stayed within 20 m
+    private static let autoPauseAfter: TimeInterval = 3 * 60    // stood still this long → pause
+    private static let autoPauseRadius: CLLocationDistance = 20 // "stood still" = within 20 m
     private let autoResumeDistance: CLLocationDistance = 25  // leave an auto-pause after moving 25 m
-    private var stationaryAnchor: CLLocationCoordinate2D?
-    private var stationaryAnchorSince: Date?
+    /// Standing-still detector. Asked both on each fix and on the clock, because
+    /// a motionless phone stops producing fixes entirely — see `StationaryMonitor`.
+    private var stationary = StationaryMonitor(radius: autoPauseRadius, after: autoPauseAfter)
 
     // Off-trail spoken distances (replaces the old rising-pitch tone).
     private let offTrailBands: [Double] = [20, 50, 100]
@@ -156,7 +157,7 @@ final class HikeSession: ObservableObject {
         paceSamples = []; movingElapsed = 0; lastIngestTime = nil
         isPaused = false; pauseIsAutomatic = false; pauseStart = nil; pausedTotal = 0
         pauseAnchorCoord = nil; pendingResumeReanchor = false
-        stationaryAnchor = nil; stationaryAnchorSince = nil
+        stationary.reset()
         lastAnnouncement = nil; hudJunction = nil; hudMeters = 0
         routeName = name
         startDate = Date()
@@ -205,7 +206,7 @@ final class HikeSession: ObservableObject {
         paceSamples = []; movingElapsed = 0; lastIngestTime = nil
         isPaused = false; pauseIsAutomatic = false; pauseStart = nil; pausedTotal = 0
         pauseAnchorCoord = nil; pendingResumeReanchor = false
-        stationaryAnchor = nil; stationaryAnchorSince = nil
+        stationary.reset()
         offTrailBandAnnounced = 0; fastSince = nil; lastFixTime = nil; strayOutstanding = false
         wrongTurnSaid = []; wrongTurnActive = false; repeatAnchor = nil; repeatAnchorSince = nil; repeatJunctionIndex = nil
 
@@ -280,7 +281,7 @@ final class HikeSession: ObservableObject {
         pendingResumeReanchor = true
         lastIngestTime = nil
         lastFixTime = nil
-        stationaryAnchor = nil; stationaryAnchorSince = nil
+        stationary.reset()
         lastAnnouncement = "Resumed"
         voice.speak("Resumed")
         saveCheckpoint()
@@ -573,15 +574,18 @@ final class HikeSession: ObservableObject {
     /// move off it, so only genuine stillness trips it.
     private func checkAutoPause(coordinate: CLLocationCoordinate2D, time: Date) {
         guard phase == .active, !isPaused else { return }
-        guard let anchor = stationaryAnchor, let since = stationaryAnchorSince else {
-            stationaryAnchor = coordinate; stationaryAnchorSince = time; return
-        }
-        let moved = CLLocation(from: anchor).distance(from: CLLocation(from: coordinate))
-        if moved > autoPauseRadius {
-            stationaryAnchor = coordinate; stationaryAnchorSince = time
-        } else if time.timeIntervalSince(since) >= autoPauseAfter {
-            pauseWalk(automatic: true)
-        }
+        stationary.noteFix(coordinate, at: time)
+        autoPauseIfStationary(now: time)
+    }
+
+    /// Pause if we have stood still long enough. Driven by the CLOCK as well as
+    /// by fixes: with a `distanceFilter` set, iOS delivers NO location updates
+    /// while the phone is motionless, so a fix-driven check can never fire in
+    /// the very case it is for. Uses absolute dates, so a timer that misses
+    /// ticks (backgrounded, suspended) still pauses on its next tick.
+    private func autoPauseIfStationary(now: Date) {
+        guard phase == .active, !isPaused, stationary.shouldPause(now: now) else { return }
+        pauseWalk(automatic: true)
     }
 
     // MARK: HUD — the next junction and distance to it
@@ -673,6 +677,9 @@ final class HikeSession: ObservableObject {
             Task { @MainActor in
                 guard let self, self.startDate != nil, self.phase == .active else { return }
                 self.elapsed = self.activeElapsed()   // frozen while paused
+                // Standing perfectly still produces no GPS fixes, so auto-pause
+                // has to be evaluated here rather than only when one arrives.
+                self.autoPauseIfStationary(now: Date())
             }
         }
     }
