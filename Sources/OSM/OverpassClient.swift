@@ -22,7 +22,8 @@ enum OverpassClient {
         "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
         "https://overpass.openstreetmap.ru/api/interpreter"
     ]
-    private static let perEndpointTimeout: TimeInterval = 20
+    // Busy mirrors can take 25 s or more to answer a junction query; 20 s gave "no turns".
+    private static let perEndpointTimeout: TimeInterval = 45
 
     static func fetchIntersections(bbox: (s: Double, w: Double, n: Double, e: Double)) async throws -> [Intersection] {
         // Trails AND ordinary streets: when a route leaves the trail network to
