@@ -566,18 +566,16 @@ final class RouteModel: ObservableObject {
         return String(format: "%.2f km", displayedDistance / 1000.0)
     }
 
-    /// Total elevation gain of the planned route (sum of positive climbs, using
-    /// the same 1 m noise floor as the live hike so pre- and in-hike numbers
-    /// agree). Nil until elevation is available.
+    /// Total elevation gain of the planned route: elevation averaged over
+    /// ±150 m of track, then climbs counted past a 5 m threshold — the same
+    /// method as the live hike, so pre- and in-hike numbers agree. Nil until
+    /// elevation is available. See `ElevationSmoothing`.
     var routeElevationGain: Double? {
-        let eles = travelPoints.compactMap(\.elevation)
-        guard eles.count > 1 else { return nil }
-        var gain = 0.0
-        for i in 1..<eles.count {
-            let climb = eles[i] - eles[i - 1]
-            if climb > 1.0 { gain += climb }
-        }
-        return gain
+        let points = travelPoints
+        guard points.compactMap(\.elevation).count > 1 else { return nil }
+        let cumulative = Geo.cumulativeDistances(points.map(\.coordinate))
+        return ElevationSmoothing.climb(cumulative: cumulative,
+                                        elevations: points.map(\.elevation)).up
     }
 
     var elevationGainText: String? {

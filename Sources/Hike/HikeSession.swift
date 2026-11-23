@@ -41,7 +41,6 @@ final class HikeSession: ObservableObject {
     @Published private(set) var routeProgress: Double = 0
     var routeTotal: Double { plannedCumulative.last ?? 0 }
 
-    private let elevationNoiseFloor = 1.0
     let offTrailThreshold: CLLocationDistance = 100
 
     // Pace ETA — a rolling window of recent *moving* travel, so breaks (and the
@@ -99,6 +98,9 @@ final class HikeSession: ObservableObject {
     private var tracker: PolylineTracker?
     private var recorded: [RecordedPoint] = []
     private var lastElevation: Double?
+    /// Climb so far, smoothed over distance with hysteresis (see ElevationSmoothing):
+    /// raw GPS altitude jitters ±5–10 m, which a fix-to-fix sum counts as climb.
+    private var climbCounter = LiveClimbCounter()
     private var startDate: Date?
     private var timer: Timer?
     private var routeName = "Hike"
@@ -153,6 +155,7 @@ final class HikeSession: ObservableObject {
         recorded = []; breadcrumb = []
         distanceWalked = 0; elevationGain = 0; offTrackMeters = 0; elapsed = 0
         lastElevation = nil; walkerRouteDistance = 0
+        climbCounter = LiveClimbCounter()
         etaCalcText = "—"; etaPaceText = "—"; paceDeltaPercent = nil
         paceSamples = []; movingElapsed = 0; lastIngestTime = nil
         isPaused = false; pauseIsAutomatic = false; pauseStart = nil; pausedTotal = 0
@@ -198,6 +201,7 @@ final class HikeSession: ObservableObject {
         walkerRouteDistance = cp.walkerRouteDistance
         routeProgress = walkerRouteDistance
         lastElevation = cp.lastElevation
+        climbCounter = LiveClimbCounter(gain: cp.elevationGain, reference: cp.lastElevation)
         routeName = name
         startDate = cp.startDate
         walker = breadcrumb.last
@@ -327,7 +331,7 @@ final class HikeSession: ObservableObject {
             elevationGain: elevationGain,
             offTrackMeters: offTrackMeters,
             walkerRouteDistance: walkerRouteDistance,
-            lastElevation: lastElevation,
+            lastElevation: climbCounter.reference ?? lastElevation,
             recorded: recorded.map(HikeCheckpoint.Fix.init)
         ))
     }
@@ -361,10 +365,11 @@ final class HikeSession: ObservableObject {
                 let dt = time.timeIntervalSince(lt)
                 if dt > 0, step / dt >= movingSpeedFloor { movingElapsed += dt }
             }
-            if let ele, let prev = lastElevation {
-                let climb = ele - prev
-                if climb > elevationNoiseFloor { elevationGain += climb }
-            }
+        }
+        if let ele {
+            if pendingResumeReanchor { climbCounter.resetWindow() }
+            climbCounter.add(distance: distanceWalked, elevation: ele)
+            elevationGain = climbCounter.gain
         }
         pendingResumeReanchor = false
         lastIngestTime = time

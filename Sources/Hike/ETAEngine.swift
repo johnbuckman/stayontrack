@@ -22,10 +22,12 @@ struct ETAEngine {
         let coords = travelPoints.map(\.coordinate)
         var cumDist = Geo.cumulativeDistances(coords)
         if distanceScale != 1 { cumDist = cumDist.map { $0 * distanceScale } }
-        // Smooth the elevation profile first — raw (esp. DEM-sampled) elevation
-        // is noisy, and Tobler's exponential slope penalty turns that noise into
-        // absurd time estimates. Slope is then clamped to a sane range.
-        let ele = Self.smoothedElevations(travelPoints.map(\.elevation))
+        // Smooth the elevation profile first (±150 m along the track, the same
+        // smoothing as the climb figure) — raw GPS / DEM elevation jitters, and
+        // Tobler's exponential slope penalty turns that noise into extra time
+        // (Pok Fu Lam read 2h55 against MapOut's 2h05). Slope is then clamped.
+        let ele = ElevationSmoothing.smoothed(cumulative: Geo.cumulativeDistances(coords),
+                                              elevations: travelPoints.map(\.elevation))
         var segT: [TimeInterval] = []
         var cumT: [TimeInterval] = [0]
 
@@ -45,21 +47,6 @@ struct ETAEngine {
         cumulativeTime = cumT
         segTime = segT
         totalDistance = cumDist.last ?? 0
-    }
-
-    /// Moving average (±2 points) over the available elevations.
-    private static func smoothedElevations(_ raw: [Double?]) -> [Double?] {
-        let n = raw.count
-        var out = [Double?](repeating: nil, count: n)
-        let r = 2
-        for i in 0..<n {
-            var sum = 0.0, count = 0
-            for j in max(0, i - r)...min(n - 1, i + r) {
-                if let e = raw[j] { sum += e; count += 1 }
-            }
-            out[i] = count > 0 ? sum / Double(count) : nil
-        }
-        return out
     }
 
     /// Predicted seconds remaining from `distance` metres along the route to the end.
@@ -93,14 +80,20 @@ struct ETAEngine {
         return max(-0.6, min(0.6, (b - a) / dist))
     }
 
-    /// Raw Tobler is too fast for how John actually walks. Calibrated Nov 2026:
-    ///   - MapOut, "murs-amonts-des-gorges-de-veroncle" (8.1 km, +250 m):
-    ///     MapOut 2h15, raw Tobler 1h55 → ×1.17
-    ///   - John's own recorded walk, 21 Jun 2026 (4.4 km, flat): 65 min moving,
-    ///     raw Tobler 56 min → ×1.16
-    /// (Komoot's built-in plans are slower still, ×1.4–1.56, and one recorded
-    /// Hong Kong stairs walk ×1.9; MapOut and John's own pace are the targets.)
-    static let paceFactor = 1.16
+    /// Raw Tobler (on the ±150 m smoothed profile) is too fast for how John
+    /// actually walks. Calibrated Nov 2026 against MapOut's own estimates and
+    /// John's recorded walks, where moving time = time at >= 1 km/h (breaks
+    /// excluded, slow steep climbing counted):
+    ///   MapOut  Pok Fu Lam plan  8.1 km   2h05 vs 117 min -> x1.07
+    ///   MapOut  Drawn 21 Nov     8.7 km   2h55 vs 128     -> x1.36
+    ///   MapOut  Murs (Luberon)   8.1 km   2h15 vs 105     -> x1.28
+    ///   walk    21 Nov 2026 HK   8.6 km   169  vs 129     -> x1.31
+    ///   walk    22 Nov 2026 HK   4.3 km    66  vs  56     -> x1.17
+    ///   walk    5 Oct 2026       8.0 km   165  vs 131     -> x1.26
+    ///   walk    21 Jun 2026      4.4 km    65  vs  53     -> x1.22
+    /// Mean x1.24. Breaks are NOT included: the longer walks also stood still
+    /// for 50–90 min in total. Komoot's built-in plans are slower still.
+    static let paceFactor = 1.25
 
     /// Tobler speed in metres/second, slowed by `paceFactor`.
     private static func toblerSpeed(_ slope: Double) -> Double {
