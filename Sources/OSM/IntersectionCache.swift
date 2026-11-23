@@ -9,7 +9,14 @@ import CryptoKit
 enum IntersectionCache {
     private struct DTO: Codable { let lat: Double; let lon: Double; let degree: Int }
 
+    /// Application Support, not Caches: iOS empties Caches when storage runs
+    /// low, which silently threw away calculated turns. Older entries are still
+    /// read from the Caches location.
     private static var directory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("JunctionCache", isDirectory: true)
+    }
+    private static var legacyDirectory: URL {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("JunctionCache", isDirectory: true)
     }
@@ -29,8 +36,9 @@ enum IntersectionCache {
     }
 
     static func load(_ key: String) -> [Intersection]? {
-        let url = directory.appendingPathComponent("\(key).json")
-        guard let data = try? Data(contentsOf: url),
+        let file = "\(key).json"
+        guard let data = (try? Data(contentsOf: directory.appendingPathComponent(file)))
+                ?? (try? Data(contentsOf: legacyDirectory.appendingPathComponent(file))),
               let dtos = try? JSONDecoder().decode([DTO].self, from: data) else { return nil }
         return dtos.map {
             Intersection(coordinate: CLLocationCoordinate2D(latitude: $0.lat, longitude: $0.lon),

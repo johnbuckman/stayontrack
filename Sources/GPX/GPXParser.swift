@@ -23,6 +23,7 @@ enum GPXParser {
     static func parse(data: Data) throws -> GPXRoute {
         let delegate = Delegate()
         let parser = XMLParser(data: data)
+        parser.shouldProcessNamespaces = true   // element names arrive unprefixed
         parser.delegate = delegate
         guard parser.parse() else { throw ParseError.malformed }
 
@@ -32,7 +33,8 @@ enum GPXParser {
         else                             { points = delegate.wpts }
 
         guard points.count >= 2 else { throw ParseError.noPoints }
-        return GPXRoute(name: delegate.trackName ?? delegate.metadataName, points: points)
+        return GPXRoute(name: delegate.trackName ?? delegate.metadataName, points: points,
+                        trail: delegate.trail)
     }
 
     static func parse(url: URL) throws -> GPXRoute {
@@ -52,6 +54,7 @@ enum GPXParser {
 
         var metadataName: String?
         var trackName: String?
+        var trail: StoredTrail?
 
         private var pendingCoord: CLLocationCoordinate2D?
         private var pendingEle: Double?
@@ -64,6 +67,24 @@ enum GPXParser {
         func parser(_ parser: XMLParser, didStartElement element: String,
                     namespaceURI: String?, qualifiedName qName: String?,
                     attributes attr: [String: String]) {
+            if namespaceURI == GPXWriter.namespace {
+                if element == "trail" {
+                    trail = StoredTrail(intersections: [], complete: attr["complete"] == "true",
+                                        length: attr["length"].flatMap(Double.init),
+                                        lengthKey: attr["lengthKey"])
+                } else if element == "junction", trail != nil,
+                          let lat = attr["lat"].flatMap(Double.init),
+                          let lon = attr["lon"].flatMap(Double.init),
+                          let deg = attr["degree"].flatMap(Int.init) {
+                    trail?.intersections.append(Intersection(
+                        coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon), degree: deg))
+                }
+                stack.append(element)
+                return
+            }
+            // Only GPX's own elements: another app's <ext:name> or <ext:ele> must not
+            // be read as the route title or a point's elevation.
+            guard Self.isGPX(namespaceURI) else { stack.append(element); return }
             switch element {
             case "trkpt": currentBucket = .trk; startPoint(attr)
             case "rtept": currentBucket = .rte; startPoint(attr)
@@ -81,6 +102,10 @@ enum GPXParser {
         func parser(_ parser: XMLParser, didEndElement element: String,
                     namespaceURI: String?, qualifiedName qName: String?) {
             let parent = stack.count >= 2 ? stack[stack.count - 2] : ""
+            guard Self.isGPX(namespaceURI) else {
+                if stack.last == element { stack.removeLast() }
+                return
+            }
             switch element {
             case "ele":
                 pendingEle = Double(text.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -98,6 +123,12 @@ enum GPXParser {
                 break
             }
             if stack.last == element { stack.removeLast() }
+        }
+
+        /// No namespace (a bare file) or GPX 1.0 / 1.1.
+        static func isGPX(_ ns: String?) -> Bool {
+            guard let ns, !ns.isEmpty else { return true }
+            return ns.hasPrefix("http://www.topografix.com/GPX/")
         }
 
         private func startPoint(_ attr: [String: String]) {

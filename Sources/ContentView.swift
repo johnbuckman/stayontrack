@@ -257,7 +257,7 @@ struct ContentView: View {
         if model.trailState == .loading {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
-                Text(String(format: "Calculating turns… %.1fs", model.trailElapsed))
+                Text("Finding turns" + turnProgressText)
                     .font(.caption.weight(.semibold)).monospacedDigit()
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
@@ -639,8 +639,8 @@ struct ContentView: View {
             }
             switch model.trailState {
             case .ready(let c): Text("· \(c) turns")
-            case .loading:      Text("· loading turns…")
-            case .failed:       Text("· no turns")
+            case .loading:      Text("· finding turns" + turnProgressText)
+            case .failed:       Text(model.junctions.isEmpty ? "· no turns" : "· \(model.junctions.count) turns (partial)")
             case .idle:         EmptyView()
             }
         }
@@ -727,20 +727,37 @@ struct ContentView: View {
             case .idle:
                 EmptyView()
             case .loading:
-                ProgressView().controlSize(.small)
-                Text("Loading trail junctions… \(Int(model.trailElapsed))s")
-                    .font(.footnote).foregroundStyle(.secondary)
+                if let p = model.trailProgress, p.total > 0 {
+                    ProgressView(value: p.fraction).frame(width: 44)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+                Text("Finding turns" + turnProgressText + " · \(model.junctions.count) so far")
+                    .font(.footnote).foregroundStyle(.secondary).monospacedDigit()
             case .ready(let count):
                 Image(systemName: "arrow.triangle.turn.up.right.diamond.fill").foregroundStyle(.green)
                 Text("\(count) turns")
                     .font(.footnote).foregroundStyle(.secondary)
             case .failed:
                 Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
-                Text("Trail junctions unavailable — no junction warnings")
+                Text(model.junctions.isEmpty
+                     ? "Couldn't reach the map servers — no turn warnings yet"
+                     : "Only part of the route checked — \(model.junctions.count) turns so far")
                     .font(.footnote).foregroundStyle(.secondary)
+                Button("Retry") { model.retryTrailFetch() }
+                    .font(.footnote.weight(.semibold))
             }
             Spacer()
         }
+    }
+
+    /// " 12/30 · 40% · ~1m 5s left" while the turn network downloads piece by
+    /// piece; just the elapsed seconds before the first count arrives.
+    private var turnProgressText: String {
+        guard let p = model.trailProgress, p.total > 0 else {
+            return "… \(Int(model.trailElapsed))s"
+        }
+        return " \(p.done)/\(p.total) · \(Int((p.fraction * 100).rounded()))%" + etaSuffix(model.trailEtaSeconds)
     }
 
     private func etaSuffix(_ seconds: TimeInterval?) -> String {

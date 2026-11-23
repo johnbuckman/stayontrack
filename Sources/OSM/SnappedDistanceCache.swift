@@ -10,7 +10,14 @@ import CryptoKit
 enum SnappedDistanceCache {
     private struct DTO: Codable { let distance: Double; let recovered: Int; let fellBack: Int }
 
+    /// Application Support, not Caches: iOS empties Caches when storage runs
+    /// low, which silently threw away calculated turns. Older entries are still
+    /// read from the Caches location.
     private static var directory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("SnappedDistanceCache", isDirectory: true)
+    }
+    private static var legacyDirectory: URL {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("SnappedDistanceCache", isDirectory: true)
     }
@@ -28,8 +35,9 @@ enum SnappedDistanceCache {
     }
 
     static func load(_ key: String) -> RouteSnapper.Result? {
-        let url = directory.appendingPathComponent("\(key).json")
-        guard let data = try? Data(contentsOf: url),
+        let file = "\(key).json"
+        guard let data = (try? Data(contentsOf: directory.appendingPathComponent(file)))
+                ?? (try? Data(contentsOf: legacyDirectory.appendingPathComponent(file))),
               let dto = try? JSONDecoder().decode(DTO.self, from: data) else { return nil }
         return RouteSnapper.Result(distance: dto.distance, recovered: dto.recovered, fellBack: dto.fellBack)
     }

@@ -23,7 +23,7 @@ enum RestaurantFinder {
     private static let corridor: CLLocationDistance = 200
 
     static func fetch(coords: [CLLocationCoordinate2D],
-                      cumulative: [CLLocationDistance]) async -> [TrailRestaurant] {
+                      cumulative: [CLLocationDistance]) async -> [TrailRestaurant]? {
         guard coords.count > 1 else { return [] }
         let lats = coords.map(\.latitude), lons = coords.map(\.longitude)
         let pad = 0.003
@@ -36,7 +36,7 @@ enum RestaurantFinder {
         );
         out;
         """
-        guard let elements = try? await OverpassPOI.fetch(query: query) else { return [] }
+        guard let elements = try? await OverpassPOI.fetch(query: query) else { return nil }
 
         var out: [TrailRestaurant] = []
         for e in elements {
@@ -87,7 +87,7 @@ enum OverpassPOI {
         let center: Center?     // present for way/relation results from `out center`
         let tags: [String: String]?
     }
-    private struct Payload: Decodable { let elements: [Element] }
+    private struct Payload: Decodable { let elements: [Element]; let remark: String? }
 
     private static let endpoints = [
         "https://overpass-api.de/api/interpreter",
@@ -104,16 +104,19 @@ enum OverpassPOI {
             request.httpMethod = "POST"
             request.setValue(osmUserAgent, forHTTPHeaderField: "User-Agent")
             request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-            request.timeoutInterval = 20
+            request.timeoutInterval = 45   // busy mirrors take 30 s or more; see OverpassClient
             do {
                 let (data, response) = try await URLSession.shared.upload(for: request, from: body)
                 guard (response as? HTTPURLResponse)?.statusCode == 200 else { continue }
                 if let payload = try? JSONDecoder().decode(Payload.self, from: data) {
+                    // A query that overran answers 200 with a "runtime error" remark and no
+                    // elements; that is a failure, not an empty area.
+                    if payload.remark?.contains("error") == true { continue }
                     return payload.elements
                 }
             } catch { continue }
         }
-        return []
+        throw URLError(.cannotConnectToHost)   // no mirror answered: not the same as "none found"
     }
 }
 

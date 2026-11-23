@@ -91,7 +91,7 @@ enum OverpassClient {
                 do {
                     let (data, response) = try await URLSession.shared.upload(for: request, from: body)
                     guard (response as? HTTPURLResponse)?.statusCode == 200 else { continue }
-                    if let payload = try? JSONDecoder().decode(Payload.self, from: data) {
+                    if let payload = try? JSONDecoder().decode(Payload.self, from: data), !payload.failed {
                         var nodes: [Int: CLLocationCoordinate2D] = [:]
                         var ways: [[Int]] = []
                         for e in payload.elements {
@@ -121,10 +121,14 @@ enum OverpassClient {
             let nodes: [Int]?
         }
         let elements: [Element]
+        let remark: String?
+        /// A query that overran answers 200 with a "runtime error" remark and no elements.
+        var failed: Bool { remark?.contains("error") == true }
     }
 
     private static func parse(_ data: Data) throws -> [Intersection] {
         let payload = try JSONDecoder().decode(Payload.self, from: data)
+        if payload.failed { throw FetchError.allEndpointsFailed }
         var coordByNode: [Int: CLLocationCoordinate2D] = [:]
         for e in payload.elements where e.type == "node" {
             if let lat = e.lat, let lon = e.lon {

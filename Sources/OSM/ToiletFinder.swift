@@ -24,7 +24,7 @@ enum ToiletFinder {
     private static let corridor: CLLocationDistance = 150
 
     static func fetch(coords: [CLLocationCoordinate2D],
-                      cumulative: [CLLocationDistance]) async -> [TrailToilet] {
+                      cumulative: [CLLocationDistance]) async -> [TrailToilet]? {
         guard coords.count > 1 else { return [] }
         let lats = coords.map(\.latitude), lons = coords.map(\.longitude)
         let pad = 0.003
@@ -39,7 +39,7 @@ enum ToiletFinder {
         );
         out center;
         """
-        guard let elements = try? await OverpassPOI.fetch(query: query) else { return [] }
+        guard let elements = try? await OverpassPOI.fetch(query: query) else { return nil }
 
         var out: [TrailToilet] = []
         for e in elements {

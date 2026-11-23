@@ -17,6 +17,9 @@ struct GPXPoint: Equatable {
 struct GPXRoute: Equatable {
     var name: String?
     var points: [GPXPoint]
+    /// Turn-network results Stay on Track saved into its own copy of the file
+    /// (nil for a GPX from another app). See `StoredTrail`.
+    var trail: StoredTrail? = nil
 
     var coordinates: [CLLocationCoordinate2D] { points.map(\.coordinate) }
     var hasElevation: Bool { points.contains { $0.elevation != nil } }
@@ -36,5 +39,26 @@ struct GPXRoute: Equatable {
 extension CLLocation {
     convenience init(from c: CLLocationCoordinate2D) {
         self.init(latitude: c.latitude, longitude: c.longitude)
+    }
+}
+
+/// What Stay on Track writes into the `<extensions>` of its saved GPX copy so a
+/// route never needs its turns recalculated: the OSM junction nodes near the
+/// route (direction-independent), whether every piece of the route was covered,
+/// and the OSM-snapped trail length together with the route key it was measured
+/// for (a length only applies to exactly those coordinates).
+struct StoredTrail: Equatable {
+    var intersections: [Intersection]
+    var complete: Bool
+    var length: Double?
+    var lengthKey: String?
+
+    static func == (a: StoredTrail, b: StoredTrail) -> Bool {
+        a.complete == b.complete && a.length == b.length && a.lengthKey == b.lengthKey
+            && a.intersections.count == b.intersections.count
+            && zip(a.intersections, b.intersections).allSatisfy {
+                $0.coordinate.latitude == $1.coordinate.latitude
+                    && $0.coordinate.longitude == $1.coordinate.longitude && $0.degree == $1.degree
+            }
     }
 }

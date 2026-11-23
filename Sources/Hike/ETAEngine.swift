@@ -93,9 +93,18 @@ struct ETAEngine {
         return max(-0.6, min(0.6, (b - a) / dist))
     }
 
-    /// Tobler speed in metres/second.
+    /// Raw Tobler is too fast for how John actually walks. Calibrated Nov 2026:
+    ///   - MapOut, "murs-amonts-des-gorges-de-veroncle" (8.1 km, +250 m):
+    ///     MapOut 2h15, raw Tobler 1h55 → ×1.17
+    ///   - John's own recorded walk, 21 Jun 2026 (4.4 km, flat): 65 min moving,
+    ///     raw Tobler 56 min → ×1.16
+    /// (Komoot's built-in plans are slower still, ×1.4–1.56, and one recorded
+    /// Hong Kong stairs walk ×1.9; MapOut and John's own pace are the targets.)
+    static let paceFactor = 1.16
+
+    /// Tobler speed in metres/second, slowed by `paceFactor`.
     private static func toblerSpeed(_ slope: Double) -> Double {
-        let kmh = 6.0 * exp(-3.5 * abs(slope + 0.05))
+        let kmh = 6.0 * exp(-3.5 * abs(slope + 0.05)) / paceFactor
         return kmh * 1000.0 / 3600.0
     }
 }

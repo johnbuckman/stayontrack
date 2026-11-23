@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 import CoreLocation
 
 /// Holds the currently loaded hike and the pre-start options (Phase 1).
@@ -67,6 +68,10 @@ final class RouteModel: ObservableObject {
     /// Grade-adjusted timing model for the current direction (cached).
     private var routeETA: ETAEngine?
     @Published var trailElapsed: TimeInterval = 0
+    /// Pieces of the route whose trail network has arrived, out of the total.
+    @Published var trailProgress: TileProgress?
+    /// Estimated seconds until every piece has arrived.
+    @Published var trailEtaSeconds: TimeInterval?
     @Published var tileEtaSeconds: TimeInterval?
 
     private var trailTimer: Timer?
@@ -106,7 +111,15 @@ final class RouteModel: ObservableObject {
     }
     var routeTotalDistance: Double { route?.totalDistance ?? 0 }
 
-    init() { restoreLastHike() }
+    init() {
+        restoreLastHike()
+        // A fetch interrupted by switching apps (iOS freezes network work in the
+        // background) is retried as soon as the app is back on screen.
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.retryTrailFetch() }
+        }
+    }
 
     // MARK: Loading
 
@@ -184,6 +197,7 @@ final class RouteModel: ObservableObject {
                 for i in updated.points.indices { updated.points[i].elevation = elevations[i] }
                 self.route = updated
                 self.elevationState = .filled
+                self.persistEnrichedCopy()
             } catch {
                 self?.elevationState = .failed
             }
@@ -192,32 +206,54 @@ final class RouteModel: ObservableObject {
 
     /// Fetches the OSM trail network so junctions can be precomputed for voice
     /// turns. Runs at import while online; failure is non-fatal (no junctions).
-    private func startTrailFetch(for route: GPXRoute) {
+    ///
+    /// Order of preference: turns stored in the GPX itself (our own saved copy),
+    /// then the on-disk cache, then the network — fetched in ~600 m pieces along
+    /// the route so turns appear on the map as each piece arrives, with a
+    /// done/total count and a time-left estimate. `seed` keeps junctions already
+    /// known (a retry, or a partial set saved in the GPX) on screen meanwhile.
+    private func startTrailFetch(for route: GPXRoute, seed: [Intersection] = []) {
         trailTask?.cancel()
         trailTimer?.invalidate()
-        intersections = []
+        intersections = seed
         junctions = []
         correctedDistance = nil
         trailElapsed = 0
+        trailProgress = nil
+        trailEtaSeconds = nil
         let coords = route.coordinates
         guard !coords.isEmpty else { trailState = .idle; return }
+
+        let cacheKey = IntersectionCache.key(for: coords)
+        let distKey = SnappedDistanceCache.key(for: coords)
+
+        // Saved in the GPX by an earlier import: nothing to calculate.
+        if let t = route.trail, t.complete {
+            intersections = t.intersections
+            if t.lengthKey == distKey { correctedDistance = t.length }
+            recomputeJunctions()
+            trailState = .ready(junctions.count)
+            return
+        }
 
         // Cached from a previous load of this exact route? Use it instantly —
         // no network, works offline. Distance is cached separately (it may be
         // missing on routes imported before snapping existed); if so we still
         // need the network to compute it, so only take the fast path when both
         // the junctions and the snapped distance are cached.
-        let cacheKey = IntersectionCache.key(for: coords)
-        let distKey = SnappedDistanceCache.key(for: coords)
         if let cached = IntersectionCache.load(cacheKey),
            let dist = SnappedDistanceCache.load(distKey) {
             intersections = cached
             correctedDistance = dist.distance
             recomputeJunctions()
             trailState = .ready(junctions.count)
+            persistEnrichedCopy()
             return
         }
 
+        let seed = seed.isEmpty ? (route.trail?.intersections ?? []) : seed
+        intersections = seed
+        recomputeJunctions()
         trailStart = Date()
         trailState = .loading
 
@@ -229,16 +265,31 @@ final class RouteModel: ObservableObject {
             }
         }
 
-        let lats = coords.map(\.latitude), lons = coords.map(\.longitude)
-        let pad = 0.003
-        let bbox = (s: lats.min()! - pad, w: lons.min()! - pad,
-                    n: lats.max()! + pad, e: lons.max()! + pad)
+        // Ask iOS for extra time if the user switches away mid-fetch (e.g. back
+        // to MapOut after sharing the GPX); otherwise the requests are frozen.
+        let bgTask = UIApplication.shared.beginBackgroundTask(withName: "trail-network")
+
         trailTask = Task { [weak self] in
+            defer { if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) } }
             do {
-                // One graph fetch serves both features: junctions are the
-                // degree-≥3 nodes; the snapper measures the route along the same
-                // ways to recover the length the sparse GPX sampling chorded off.
-                let (nodes, ways) = try await OverpassClient.fetchGraph(bbox: bbox)
+                // One graph serves both features: junctions are the degree-≥3
+                // nodes; the snapper measures the route along the same ways to
+                // recover the length the sparse GPX sampling chorded off.
+                let graph = try await TrailNetworkFetcher.fetch(coords: coords) { [weak self] g, done, total in
+                    guard let self, !Task.isCancelled else { return }
+                    self.trailProgress = TileProgress(done: done, total: total)
+                    if let start = self.trailStart, done > 0, done < total {
+                        let rate = Double(done) / max(Date().timeIntervalSince(start), 0.001)
+                        self.trailEtaSeconds = Double(total - done) / rate
+                    } else {
+                        self.trailEtaSeconds = nil
+                    }
+                    guard done > 0 else { return }
+                    let found = OverpassClient.deriveIntersections(nodes: g.nodes, ways: g.wayLists)
+                    self.intersections = Self.union(seed, found)
+                    self.recomputeJunctions()
+                }
+                let nodes = graph.nodes, ways = graph.wayLists
                 let found = OverpassClient.deriveIntersections(nodes: nodes, ways: ways)
                 let snapped = await Task.detached(priority: .utility) {
                     RouteSnapper.correctedDistance(coords: coords, nodes: nodes, ways: ways)
@@ -250,12 +301,53 @@ final class RouteModel: ObservableObject {
                 self.intersections = found
                 self.correctedDistance = snapped.distance
                 self.recomputeJunctions()
+                self.trailEtaSeconds = nil
                 self.trailState = .ready(self.junctions.count)
+                self.persistEnrichedCopy()
             } catch {
-                self?.trailTimer?.invalidate(); self?.trailTimer = nil
-                self?.trailState = .failed
+                guard let self, !Task.isCancelled else { return }
+                // Some pieces failed: keep the turns that did arrive (already
+                // published), remember them in the GPX copy, and offer a retry.
+                self.trailTimer?.invalidate(); self.trailTimer = nil
+                self.trailEtaSeconds = nil
+                self.trailState = .failed
+                self.persistEnrichedCopy()
             }
         }
+    }
+
+    /// Try the turn network again, keeping the turns already found on screen.
+    /// Called by the Retry button and automatically when the app returns to the
+    /// foreground after a failed attempt.
+    func retryTrailFetch() {
+        guard let route, trailState == .failed else { return }
+        startTrailFetch(for: route, seed: intersections)
+    }
+
+    private static func union(_ a: [Intersection], _ b: [Intersection]) -> [Intersection] {
+        guard !a.isEmpty else { return b }
+        var seen = Set<String>()
+        var out: [Intersection] = []
+        for i in b + a {
+            let k = String(format: "%.6f,%.6f", i.coordinate.latitude, i.coordinate.longitude)
+            if seen.insert(k).inserted { out.append(i) }
+        }
+        return out
+    }
+
+    /// Rewrites the saved copy of the route (`last-hike.gpx`) with everything
+    /// worked out so far — filled-in elevation, the turn network and the true
+    /// trail length — so reopening it never recalculates.
+    private func persistEnrichedCopy() {
+        guard var r = route else { return }
+        let complete: Bool = { if case .ready = trailState { return true }; return false }()
+        guard complete || !intersections.isEmpty else { return }
+        r.trail = StoredTrail(intersections: intersections,
+                              complete: complete,
+                              length: correctedDistance,
+                              lengthKey: correctedDistance == nil ? nil
+                                  : SnappedDistanceCache.key(for: r.coordinates))
+        try? Data(GPXWriter.gpxString(route: r).utf8).write(to: lastGPXURL, options: .atomic)
     }
 
     /// Nearby eateries (within ~200 m of the trail), cached per-route for
@@ -274,8 +366,8 @@ final class RouteModel: ObservableObject {
         restaurantTask = Task { [weak self] in
             let found = await RestaurantFinder.fetch(coords: coords, cumulative: cum)
             guard let self, !Task.isCancelled else { return }
-            RestaurantCache.save(cacheKey, found)
-            self.restaurants = found
+            if let found { RestaurantCache.save(cacheKey, found) }   // a failed lookup is retried next import
+            self.restaurants = found ?? []
         }
     }
 
@@ -304,8 +396,8 @@ final class RouteModel: ObservableObject {
         toiletTask = Task { [weak self] in
             let found = await ToiletFinder.fetch(coords: coords, cumulative: cum)
             guard let self, !Task.isCancelled else { return }
-            ToiletCache.save(cacheKey, found)
-            self.toilets = found
+            if let found { ToiletCache.save(cacheKey, found) }
+            self.toilets = found ?? []
         }
     }
 
