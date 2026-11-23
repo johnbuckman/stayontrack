@@ -13,6 +13,15 @@ struct LaterWalk: Identifiable, Codable, Equatable {
     var estimatedSeconds: Double?
 
     var fileURL: URL { SavedForLaterStore.directory.appendingPathComponent(fileName) }
+    /// Optional Markdown comments, kept beside the GPX with the same name and a
+    /// `.md` extension, so they can be copied in from outside like the GPX.
+    var notesURL: URL {
+        SavedForLaterStore.directory.appendingPathComponent((fileName as NSString).deletingPathExtension + ".md")
+    }
+    var hasNotes: Bool {
+        guard let n = try? String(contentsOf: notesURL, encoding: .utf8) else { return false }
+        return !n.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var summaryText: String {
         var parts = [String(format: "%.1f km", distanceMeters / 1000)]
@@ -89,7 +98,23 @@ final class SavedForLaterStore: ObservableObject {
         return walk
     }
 
+    /// The walk's Markdown comments ("" if none).
+    func notes(for walk: LaterWalk) -> String {
+        (try? String(contentsOf: walk.notesURL, encoding: .utf8)) ?? ""
+    }
+
+    /// Save (or, when empty, remove) the walk's comments.
+    func setNotes(_ text: String, for walk: LaterWalk) {
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            try? FileManager.default.removeItem(at: walk.notesURL)
+        } else {
+            try? Data(text.utf8).write(to: walk.notesURL, options: .atomic)
+        }
+        objectWillChange.send()
+    }
+
     func delete(_ walk: LaterWalk) {
+        try? FileManager.default.removeItem(at: walk.notesURL)
         try? FileManager.default.removeItem(at: walk.fileURL)
         walks.removeAll { $0.id == walk.id }
         persist()

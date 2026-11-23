@@ -19,12 +19,24 @@ struct SavedForLaterView: View {
                     List {
                         ForEach(store.walks) { walk in
                             HStack(spacing: 12) {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(walk.name).font(.headline)
-                                    Text(walk.summaryText).font(.caption).foregroundStyle(.secondary)
-                                    Text(walk.addedText).font(.caption2).foregroundStyle(.tertiary)
+                                NavigationLink {
+                                    SavedWalkDetailView(store: store, walk: walk,
+                                                        onWalk: { url in onWalk(url); dismiss() })
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        HStack(spacing: 5) {
+                                            Text(walk.name).font(.headline)
+                                            if walk.hasNotes {
+                                                Image(systemName: "text.bubble").font(.caption)
+                                                    .foregroundStyle(.secondary)
+                                                    .accessibilityLabel("Has comments")
+                                            }
+                                        }
+                                        Text(walk.summaryText).font(.caption).foregroundStyle(.secondary)
+                                        Text(walk.addedText).font(.caption2).foregroundStyle(.tertiary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
-                                .frame(maxWidth: .infinity, alignment: .leading)
                                 Button("Walk") { onWalk(walk.fileURL); dismiss() }
                                     .buttonStyle(.borderedProminent)
                                     .controlSize(.small)
