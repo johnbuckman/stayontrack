@@ -35,6 +35,11 @@ struct ContentView: View {
     @State private var showStopConfirm = false
     @State private var showLocationDenied = false
     @State private var showWalkList = false
+    @StateObject private var laterStore = SavedForLaterStore()
+    @State private var showLater = false
+    /// A GPX just handed over by another app, waiting for "Walk now" / "Save for later".
+    @State private var incoming: IncomingGPX?
+    @State private var toast: String?
     @State private var showFood = false
     @State private var showToilets = false
     @State private var pendingResume: HikeCheckpoint?     // crash-recovery offer
@@ -66,7 +71,31 @@ struct ContentView: View {
             Text(model.errorMessage ?? "")
         }
         .task { offerResumeIfInterrupted() }
-        .onOpenURL { handleOpenedGPX($0) }
+        .onOpenURL { receiveGPX($0) }
+        .confirmationDialog(incoming?.title ?? "New walk",
+                            isPresented: Binding(get: { incoming != nil },
+                                                 set: { if !$0 { incoming = nil } }),
+                            titleVisibility: .visible,
+                            presenting: incoming) { gpx in
+            Button("Walk now") { handleOpenedGPX(gpx.data) }
+            Button("Save for later") { saveForLater(gpx) }
+            Button("Cancel", role: .cancel) {}
+        } message: { gpx in
+            Text(gpx.summary)
+        }
+        .overlay(alignment: .top) {
+            if let toast {
+                Label(toast, systemImage: "bookmark.fill")
+                    .font(.callout.weight(.semibold))
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(.thinMaterial, in: Capsule())
+                    .padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .sheet(isPresented: $showLater) {
+            SavedForLaterView(store: laterStore, onWalk: loadSavedWalk)
+        }
         // When the OSM junctions for the current route finish loading (Overpass
         // is async), push them into an in-progress hike — the case that matters
         // is a new GPX opened mid-trail, whose turns aren't ready at start.
@@ -114,16 +143,41 @@ struct ContentView: View {
         }
     }
 
-    /// A GPX opened (share sheet / Files / open-in). If a hike is already
-    /// running, drop it and start following the new route instead of continuing
-    /// to guide the old trail.
-    private func handleOpenedGPX(_ url: URL) {
+    /// A GPX handed over by another app (share sheet / Files / open-in): read it
+    /// now, while the security-scoped URL is valid, then ask whether to walk it
+    /// now or save it for later.
+    private func receiveGPX(_ url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url) else {
+            model.errorMessage = "Couldn't read \(url.lastPathComponent)."
+            return
+        }
+        guard let route = try? GPXParser.parse(data: data) else {
+            model.errorMessage = GPXParser.ParseError.malformed.localizedDescription
+            return
+        }
+        incoming = IncomingGPX(data: data, fileName: url.deletingPathExtension().lastPathComponent, route: route)
+    }
+
+    private func saveForLater(_ gpx: IncomingGPX) {
+        guard laterStore.add(data: gpx.data, suggestedName: gpx.fileName) != nil else {
+            model.errorMessage = "Couldn't save this walk."
+            return
+        }
+        withAnimation { toast = "Saved for later" }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { withAnimation { toast = nil } }
+    }
+
+    /// "Walk now": if a hike is already running, drop it and start following
+    /// the new route instead of continuing to guide the old trail.
+    private func handleOpenedGPX(_ data: Data) {
         let wasHiking = hike.isActive
         if wasHiking {
             hike.reset()
             location.stop()
         }
-        model.load(from: url)
+        model.load(data: data)
         // Auto-start on the new route so guidance continues seamlessly. Junctions
         // are the geometry set until Overpass finishes filling model.intersections
         // in the background (same tradeoff as any freshly-imported route).
@@ -173,6 +227,14 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            .padding(.horizontal, 40)
+            Button { showLater = true } label: {
+                Label(laterStore.walks.isEmpty ? "Saved for later"
+                                               : "Saved for later (\(laterStore.walks.count))",
+                      systemImage: "bookmark")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
             .padding(.horizontal, 40)
         }.padding()
     }
@@ -588,6 +650,12 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(Color.gray.opacity(0.7))
                 .fixedSize()
+                Button { showLater = true } label: {
+                    Label("Later", systemImage: "bookmark").lineLimit(1)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Color.gray.opacity(0.7))
+                .fixedSize()
                 Spacer()
             }
 
@@ -802,4 +870,24 @@ struct ContentView: View {
 extension View {
     /// Subtle white glow so dark text stays legible over the map/chart.
     func legibleGlow() -> some View { shadow(color: .white.opacity(0.7), radius: 1) }
+}
+
+/// A GPX received from another app, held until the user picks
+/// "Walk now" or "Save for later".
+struct IncomingGPX: Identifiable {
+    let id = UUID()
+    let data: Data
+    let fileName: String
+    let route: GPXRoute
+
+    var title: String { route.name ?? fileName }
+    var summary: String {
+        let cumulative = Geo.cumulativeDistances(route.coordinates)
+        var parts = [String(format: "%.1f km", (cumulative.last ?? 0) / 1000)]
+        if route.hasElevation {
+            let up = ElevationSmoothing.climb(cumulative: cumulative, elevations: route.points.map(\.elevation)).up
+            parts.append(String(format: "%.0f m climb", up))
+        }
+        return parts.joined(separator: " · ")
+    }
 }
